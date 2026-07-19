@@ -4,7 +4,9 @@
   "description": "AI-enabled document scanning and management platform",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "for t in qrbill invoices blank pipeline; do ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron ../tests/test_$t.js || exit 1; done",
+    "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "license": "MIT",
   "devDependencies": {
@@ -13,7 +15,8 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
+    "jpeg-js": "^0.4.4",
     "pdfjs-dist": "^4.10.38",
-    "sharp": "^0.35.3"
+    "pngjs": "^7.0.0"
   }
 }

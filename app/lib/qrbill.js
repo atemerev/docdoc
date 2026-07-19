@@ -254,26 +254,47 @@ async function findQrbill(imagePaths) {
 }
 
 async function renderQrPng(payload) {
-  // Swiss QR PNG with the 7/46 Swiss-cross overlay per the IG (ECC level M
-  // absorbs it) -- qrencode CLI + sharp SVG composite.
-  const sharp = require("sharp");
-  const { stdout } = await execFileP(
-    "qrencode", ["-t", "PNG", "-l", "M", "-s", "10", "-m", "4", "-o", "-"],
-    { encoding: "buffer", input: payload, maxBuffer: 16 << 20 });
-  const img = sharp(stdout);
-  const { width } = await img.metadata();
-  const s = Math.round(width * 7 / 46);
-  const stroke = Math.max(1, Math.round(s / 24));
+  // Swiss QR PNG with the centered 7/46 Swiss cross per the IG (ECC level
+  // M absorbs it) -- qrencode CLI, cross drawn pixel-wise with pngjs
+  // (pure JS; native image libs segfault under Electron on Linux).
+  const { PNG } = require("pngjs");
+  const { spawn } = require("child_process");
+  const stdout = await new Promise((resolve, reject) => {
+    const child = spawn("qrencode",
+      ["-t", "PNG", "-l", "M", "-s", "10", "-m", "4", "-o", "-"]);
+    const chunks = [];
+    child.stdout.on("data", (c) => chunks.push(c));
+    child.on("error", reject);
+    child.on("close", (code) => code === 0
+      ? resolve(Buffer.concat(chunks))
+      : reject(new Error(`qrencode exited ${code}`)));
+    child.stdin.end(payload);
+  });
+  const img = PNG.sync.read(stdout);
+  const w = img.width;
+  const s = Math.round(w * 7 / 46);
+  const border = Math.max(1, Math.round(s / 24));
   const arm = Math.round(s * 0.58), thick = Math.round(s * 0.18);
-  const c = s / 2;
-  const cross = Buffer.from(
-    `<svg width="${s}" height="${s}" xmlns="http://www.w3.org/2000/svg">
-       <rect x="0" y="0" width="${s}" height="${s}" fill="black"
-             stroke="white" stroke-width="${stroke}"/>
-       <rect x="${c - thick / 2}" y="${c - arm / 2}" width="${thick}" height="${arm}" fill="white"/>
-       <rect x="${c - arm / 2}" y="${c - thick / 2}" width="${arm}" height="${thick}" fill="white"/>
-     </svg>`);
-  return img.composite([{ input: cross, gravity: "centre" }]).png().toBuffer();
+  const cx = Math.floor(w / 2), cy = Math.floor(img.height / 2);
+  const put = (x, y, v) => {
+    const i = (y * w + x) * 4;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = 255;
+  };
+  const x0 = cx - Math.floor(s / 2), y0 = cy - Math.floor(s / 2);
+  for (let y = y0; y < y0 + s; y++)
+    for (let x = x0; x < x0 + s; x++) {
+      const edge = x - x0 < border || x0 + s - 1 - x < border
+                || y - y0 < border || y0 + s - 1 - y < border;
+      put(x, y, edge ? 255 : 0);                       // white outline, black box
+    }
+  for (let y = cy - Math.floor(arm / 2); y < cy + Math.ceil(arm / 2); y++)
+    for (let x = cx - Math.floor(thick / 2); x < cx + Math.ceil(thick / 2); x++)
+      put(x, y, 255);                                  // vertical arm
+  for (let y = cy - Math.floor(thick / 2); y < cy + Math.ceil(thick / 2); y++)
+    for (let x = cx - Math.floor(arm / 2); x < cx + Math.ceil(arm / 2); x++)
+      put(x, y, 255);                                  // horizontal arm
+  return PNG.sync.write(img);
 }
 
 const buildSpc = (qr) => qr.payload ?? null;

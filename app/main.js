@@ -152,6 +152,14 @@ app.whenReady().then(async () => {
   api = new Api();
   dataRoot = api.cfg.data_root;
   startChangePoller();
+  // in-app batch watcher -- unless the legacy Python daemon still runs
+  // (migration safety: two watchers would double-process every batch)
+  const legacy = await api._pgrep("python.*docdoc\\.watchd");
+  if (legacy.length)
+    console.log(`watcher: legacy docdocd running (pid ${legacy}), ` +
+                "in-app watcher stays off");
+  else
+    require("./lib/watcher").start();
   await createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
