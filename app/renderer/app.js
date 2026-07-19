@@ -456,6 +456,10 @@ async function openDetail(id, { keepPdf = false } = {}) {
     state.detailPending === "queued" && d.pending !== "queued";
   state.detailId = id;
   state.detailPending = d.pending;
+  // sync list highlighting without a refetch (rows render .selected from
+  // state.detailId, which we just changed)
+  $$(".doc-row").forEach((el) =>
+    el.classList.toggle("selected", parseInt(el.dataset.id, 10) === id));
   const panel = $("#detail");
   panel.classList.remove("hidden");
   const tags = JSON.parse(d.tags || "[]");
