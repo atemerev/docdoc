@@ -22,12 +22,16 @@
   provisional name); OCR + AI run per document on a persistent background
   queue (survives restarts, "reading…" chip until done) and fill in text,
   metadata and the final archive filename live.
+- **Multi-document stacks**: when several documents are fed as one scan
+  (e.g. two invoices), the AI reports the page grouping; the pipeline
+  splits the PDF, re-extracts each part with its own QR-bill, and files
+  them as separate documents with their own invoice records.
 - **Abort**: one button in the app stops everything in flight — kills the
-  running scan (buttond SIGUSR2) and the background queue mid-stage
-  (docdocd SIGUSR1, OCR/AI child killed) and deletes all temp scans:
-  partial batch, waiting/queued batches, workdirs and every ingested
-  document still awaiting OCR/AI (row, PDF, thumbnail, originals).
-  Fully processed documents are never touched.
+  running scanimage and the background queue mid-stage (OCR/AI children
+  killed) and deletes all temp scans: partial batch, waiting/queued
+  batches, workdirs and every ingested document still awaiting OCR/AI
+  (row, PDF, thumbnail, originals). Fully processed documents are never
+  touched.
 - **OCR**: OCRmyPDF/tesseract 5 with tessdata_best (deu+fra+ita+eng),
   auto-rotate, deskew, per-page text, thumbnails.
 - **AI understanding (vision)**: document type, sender (canonical registry),
@@ -61,9 +65,7 @@
 
 ## Roadmap (from research; roughly ordered)
 
-1. **Document splitting**: several documents in one feeder stack, split on
-   separator pages / AI-detected boundaries.
-2. **Email-in**: forward invoice mails to a local address → same pipeline
+1. **Email-in**: forward invoice mails to a local address → same pipeline
    (Papra's most-loved feature). Also drag-and-drop PDF import in the app.
 3. **Due-date notifications**: scheduled reminders ("Helvetia due in 3
    days"), paperless-ngx-style scheduled workflow triggers.
@@ -73,16 +75,10 @@
    confirmed documents only, as a cheap pre-AI pass (paperless-ngx auto).
 6. **RAG chat**: "when does my Helvetia policy renew?" over the archive
    (embeddings + local LLM; 4×4090 available).
-7. **Local VLM option**: Qwen3-VL via ollama for a fully-offline AI
-   provider.
-8. **eBill awareness**: parse lines 33/34 alternative procedures.
-9. **pain.001 export**: batch-pay open invoices via e-banking upload.
-10. **Retention rules**: Swiss 10-year business-document retention hints,
-    archive expiry review.
-11. **Mobile companion / share links**, document versions, audit trail.
-12. **PDF/A verification + jbig2 compression** (build jbig2enc) for
+7. **eBill awareness**: parse lines 33/34 alternative procedures.
+8. **pain.001 export**: batch-pay open invoices via e-banking upload.
+9. **Retention rules**: Swiss 10-year business-document retention hints,
+   archive expiry review.
+10. **Mobile companion / share links**, document versions, audit trail.
+11. **PDF/A verification + jbig2 compression** (build jbig2enc) for
     smaller archives.
-- **Multi-document stacks**: when several documents are fed as one scan
-  (e.g. two invoices), the AI reports the page grouping; the pipeline
-  splits the PDF, re-extracts each part with its own QR-bill, and files
-  them as separate documents with their own invoice records.
