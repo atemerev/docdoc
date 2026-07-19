@@ -72,17 +72,43 @@ function stop() {
   dirState.clear();
 }
 
+const fileTimers = new Map();    // loose pushed files -> settle timer
+
 function sweep(cfg) {
-  // (re)track every visible batch directory in scans_dir
+  // (re)track every visible batch directory in scans_dir; loose files
+  // (the scanner's SFTP/FTP push delivers a PDF per job, no directory)
+  // get their own batch dir once the upload has settled
   let names;
   try { names = fs.readdirSync(cfg.scans_dir); } catch { return; }
   for (const name of names.sort()) {
     if (name.startsWith(".")) continue;
-    const dir = path.join(cfg.scans_dir, name);
-    let isDir = false;
-    try { isDir = fs.statSync(dir).isDirectory(); } catch {}
-    if (!isDir) continue;
-    track(cfg, name, dir);
+    const p = path.join(cfg.scans_dir, name);
+    let st = null;
+    try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) {
+      track(cfg, name, p);
+      continue;
+    }
+    if (!/\.(pdf|jpe?g|png|tiff?)$/i.test(name)) continue;
+    // uploads have no close signal visible to fs.watch -- give the
+    // transfer a quiet window, re-armed on every event, then batch it
+    clearTimeout(fileTimers.get(name));
+    fileTimers.set(name, setTimeout(() => {
+      fileTimers.delete(name);
+      try {
+        if (!fs.existsSync(p)) return;
+        const stamp = new Date().toISOString().slice(0, 19)
+          .replace("T", "_").replace(/:/g, "").slice(0, 17);
+        const dir = path.join(cfg.scans_dir,
+          `${stamp}_${name.replace(/[^A-Za-z0-9._-]/g, "")}`.slice(0, 80));
+        fs.mkdirSync(dir);
+        fs.renameSync(p, path.join(dir, name));
+        fs.writeFileSync(path.join(dir, MARKER), "");
+        pipeline.log(`watcher: pushed file ${name} -> ${path.basename(dir)}`);
+      } catch (e) {
+        pipeline.log(`watcher: pushed file ${name}: ${e.message}`);
+      }
+    }, 5000));
   }
   // forget vanished dirs
   for (const [name, st] of dirState)
@@ -151,6 +177,9 @@ async function ready(cfg, name, dir) {
     pipeline.finishBatch(cfg, dir, true, true);
     queue.push(docId);
     if (wakeWorker) wakeWorker();
+  } catch (e) {
+    pipeline.log(`watcher: ${name}: FAILED: ${e.message}`);
+    db.event(con, "error", `batch failed: ${e.message}`, { batch: name });
   } finally {
     const cur = dirState.get(name);
     if (cur) {

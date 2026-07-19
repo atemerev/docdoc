@@ -1,9 +1,22 @@
 # docdoc — features
 
-## Implemented (v0.1)
+## Implemented (v0.2)
 
+- **Single-app architecture**: one Electron app owns everything — data
+  layer in-process (better-sqlite3), pipeline and watcher as in-app
+  modules spawning native CLI tools, tray + login autostart. No Python,
+  no systemd services, no stdio API server (all removed 2026-07-20; the
+  old implementation is at git tag `python-final`).
+- **Button scanning, zero polling**: the ADS-4300N's hardware buttons
+  push scans (PDF over SFTP, Ethernet, firmware-side) into ~/Scans; the
+  in-app watcher picks them up via inotify. The app's Scan button drives
+  scanimage over eSCL/USB. No paper-sensor polling anywhere.
+- **Local AI option**: `local-vllm` provider (OpenAI-compatible endpoint,
+  structured outputs) for fully offline extraction with Qwen3-VL on this
+  machine's GPUs (~6 s/doc benchmarked); claude-cli remains the cloud
+  option and the fallback tier.
 - **Drop-in pipeline**: paper inserted → searchable PDF/A archive +
-  desktop notification, fully automatic (scan-buttond + docdocd services).
+  desktop notification, fully automatic.
 - **Instant visibility**: the scanned PDF is filed and viewable in the app
   ~1 s after the feeder stops (fast ingest: raw PDF + thumbnail under a
   provisional name); OCR + AI run per document on a persistent background

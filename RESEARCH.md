@@ -261,7 +261,10 @@ fallback.
   multi-stage pipeline" paper — distrust aggressive pipeline-speedup
   numbers from that literature.
 
-### Benchmarked on this machine (2026-07-19, tests/bench_vlm.py)
+### Benchmarked on this machine (2026-07-19)
+
+(The Python benchmark harness `tests/bench_vlm.py` was removed with the
+Python port — it lives in git history at tag `python-final`.)
 
 vLLM 0.25.1 in /pool/docdoc/vllm/venv, models in /pool/docdoc/hf
 (HF_HOME — /home is full). 12 real reviewed documents (fr/de Swiss mail,
@@ -304,6 +307,41 @@ extractor** (5.7 s/doc ≈ 4–6× faster than the cloud AI stage, offline);
 close the ~8 pp taxonomy gap with prompt class-rules + guided JSON
 (+ layout-text input, the research's +3–18 pp lever, untested here).
 Escalation tier: 32B (slow but 92 %) or claude-cli when online.
+
+## Zero-polling button scanning on the ADS-4300N (2026-07-20)
+
+Researched with primary sources (Brother manuals, MS WSD docs, sane-airscan,
+paperless-ngx community); the user wants the scanner's hardware buttons to
+drive scanning with no host-side polling.
+
+- **Over USB, polling is unavoidable**: eSCL is purely client-initiated
+  HTTP (no subscribe/notify of any kind); Brother's scan-key push tool
+  (brscan-skey) is not offered for this model (Linux downloads list only
+  the scanner driver, v1.7.0-0 of 06/2026); the panel's dedicated
+  "Scan to PC" button needs iPrint&Scan (Windows/Mac only). scanbd is
+  polling in a trenchcoat (500 ms SANE-option polls) and sane-airscan
+  exposes no button options anyway.
+- **Over Ethernet the firmware pushes**: the 4300N panel has three
+  programmable **Network Device Scan Buttons** assignable (via Web Based
+  Management → Scan → Scan to Network Device) to exactly four functions:
+  Scan to FTP/SFTP, Scan to Network (SMB/CIFS, NTLMv2 only, clock must be
+  SNTP-synced), Scan to PC (iPrint&Scan), WS Scan. Scan to Email exists
+  only on the 4700W/4900W.
+- **WSD (WS-Scan) is true push** (client subscribes, device sends
+  ScanAvailableEvent on button press) and the 4300N speaks it, but Linux
+  tooling is unmaintained hobby code (Tobag/wsd-scan, PyWSD) never tested
+  against this model — an afternoon experiment at most.
+- **Chosen: Scan-to-SFTP profile on button 1 → PDF lands in ~/Scans →
+  inotify (IN_CLOSE_WRITE-ish settle) picks it up.** Zero polling, all
+  components boring. Model-specific gotcha (paperless-ngx #2773, same
+  model): the firmware's SFTP client needs an **RSA host key** enabled in
+  sshd and can't do ed25519; password auth works, key auth via web-UI
+  import. Scans arrive as one multipage PDF per job (Document Separation
+  can split — then a quiesce window is needed; the watcher has one).
+- USB stays in parallel for on-demand `scanimage` from the app's Scan
+  button; the paths don't conflict (device serializes jobs).
+
+Setup steps for this machine are in README.md "Scanner button setup".
 
 ## Single-app decision: port the Python side to JS (2026-07-19)
 

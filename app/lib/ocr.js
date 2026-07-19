@@ -144,10 +144,18 @@ async function thumbnail(pdfPath, outJpg, width = 480) {
   return base + ".jpg";
 }
 
+async function pdfToImages(pdfPath, outDir, dpi = 300) {
+  // Render every page as page-N.jpg (scanner-pushed PDFs arrive without
+  // page images; downstream QR/AI/blank detection needs them).
+  await run("pdftoppm", ["-jpeg", "-r", String(dpi),
+    pdfPath, path.join(outDir, "page")]);
+  return outDir;
+}
+
 async function pageCount(pdfPath) {
   const { stdout } = await run("qpdf", ["--show-npages", pdfPath]);
   return parseInt(stdout.trim(), 10);
 }
 
 module.exports = { OcrError, TESSDATA_DIR, imagesToPdf, ocrPdf, inkCoverage,
-                   isBlank, rebuildPdf, thumbnail, pageCount };
+                   isBlank, rebuildPdf, thumbnail, pdfToImages, pageCount };

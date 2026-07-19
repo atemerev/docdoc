@@ -418,7 +418,7 @@ class Api {
       watcher_alive: watcherAlive,
       scanner_alive: scannerAlive,
       scanner_online: scanner.available()
-        ? scanner.online()
+        ? await scanner.online()
         : fs.existsSync(path.join(sd, ".scanner-online")),
       busy: Boolean(scanning.length || waiting.length || queued.length
                     || processing.length),

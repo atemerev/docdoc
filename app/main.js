@@ -7,8 +7,10 @@
 // App files and document bytes are served over the app:// scheme so the
 // renderer runs on a proper secure origin (pdf.js workers, fetch, etc.).
 
-const { app, BrowserWindow, ipcMain, protocol, net, shell, Notification } =
-  require("electron");
+const { app, BrowserWindow, ipcMain, protocol, net, shell, Notification,
+        Tray, Menu } = require("electron");
+const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
@@ -17,6 +19,7 @@ const { Api } = require("./lib/api");
 let win = null;
 let api = null;
 let dataRoot = null;
+let tray = null;
 
 // ---------------------------------------------------------------- api
 async function call(method, params) {
@@ -118,6 +121,13 @@ async function createWindow() {
     },
   });
   win.setMenuBarVisibility(false);
+  // close-to-tray: the app keeps scanning/processing with the window shut
+  win.on("close", (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      win.hide();
+    }
+  });
   win.webContents.on("console-message", (_e, level, message, line, src) => {
     if (level >= 2) console.log(`[renderer:${level}] ${message} (${src}:${line})`);
   });
@@ -147,11 +157,54 @@ ipcMain.handle("open-folder", async (_e, id) => {
   if (doc.pdf_abs) shell.showItemInFolder(doc.pdf_abs);
 });
 
+function setupTray() {
+  tray = new Tray(path.join(__dirname, "docdoc.png"));
+  tray.setToolTip("docdoc");
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "Open docdoc", click: () => showWindow() },
+    { label: "Scan now", click: () => call("scan_now").catch((e) =>
+        new Notification({ title: "Scan failed", body: e.message }).show()) },
+    { type: "separator" },
+    { label: "Quit", click: () => { app.isQuitting = true; app.quit(); } },
+  ]));
+  tray.on("click", () => showWindow());
+}
+
+async function showWindow() {
+  if (win && !win.isDestroyed()) { win.show(); win.focus(); }
+  else await createWindow();
+}
+
+function setupAutostart() {
+  // start (hidden) at login so button-pushed scans are processed without
+  // anyone opening the app -- the single-app replacement for systemd units
+  const dir = path.join(os.homedir(), ".config", "autostart");
+  const file = path.join(dir, "docdoc.desktop");
+  const exec = `${process.execPath} ${__dirname} --hidden`;
+  const content = `[Desktop Entry]
+Type=Application
+Name=docdoc
+Comment=Document scanning and management
+Exec=${exec}
+Icon=${path.join(__dirname, "docdoc.png")}
+X-GNOME-Autostart-enabled=true
+`;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(file) || fs.readFileSync(file, "utf-8") !== content)
+      fs.writeFileSync(file, content);
+  } catch (e) {
+    console.log(`autostart: ${e.message}`);
+  }
+}
+
 app.whenReady().then(async () => {
   registerProtocol();
   api = new Api();
   dataRoot = api.cfg.data_root;
   startChangePoller();
+  setupTray();
+  setupAutostart();
   // in-app batch watcher -- unless the legacy Python daemon still runs
   // (migration safety: two watchers would double-process every batch)
   const legacy = await api._pgrep("python.*docdoc\\.watchd");
@@ -160,13 +213,15 @@ app.whenReady().then(async () => {
                 "in-app watcher stays off");
   else
     require("./lib/watcher").start();
-  await createWindow();
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+  if (!process.argv.includes("--hidden")) await createWindow();
+  app.on("activate", () => showWindow());
 });
 
-app.on("before-quit", () => { app.isQuitting = true; });
+app.on("before-quit", () => {
+  app.isQuitting = true;
+  require("./lib/scanner").stop();
+  require("./lib/watcher").stop();
+});
 app.on("window-all-closed", () => {
-  app.quit();
+  // stay alive in the tray; Quit lives in the tray menu
 });

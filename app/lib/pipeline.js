@@ -84,18 +84,35 @@ function archiveName(ext, docId, title) {
   return path.join(year, fname);
 }
 
+function batchPdf(batchDir) {
+  // A batch pushed by the scanner itself (SFTP/FTP/SMB button scan) is a
+  // single multipage PDF instead of page images.
+  let entries;
+  try { entries = fs.readdirSync(batchDir); } catch { return null; }
+  const pdfs = entries.filter((f) => f.toLowerCase().endsWith(".pdf")).sort();
+  return pdfs.length ? path.join(batchDir, pdfs[0]) : null;
+}
+
 // ------------------------------------------------------------- stage 1
 async function ingestBatch(cfg, con, batchDir) {
   // Fast foreground stage: the scanned pages become a filed, viewable
   // document within seconds. Returns the document id (pending='queued',
   // to be picked up by the background queue) or null (empty batch).
   const batch = path.basename(batchDir.replace(/\/+$/, ""));
-  const images = batchImages(batchDir);
+  let images = batchImages(batchDir);
+  const srcPdf = images.length ? null : batchPdf(batchDir);
+  if (!images.length && srcPdf) {
+    // render page images so QR decode, vision AI and blank detection see
+    // the same inputs a scanimage batch provides
+    await ocr.pdfToImages(srcPdf, batchDir);
+    images = batchImages(batchDir);
+  }
   if (!images.length) {
     log(`pipeline: ${batch}: no images, skipping`);
     return null;
   }
-  log(`pipeline: ${batch}: ingesting ${images.length} page image(s)`);
+  log(`pipeline: ${batch}: ingesting ${images.length} page image(s)`
+      + (srcPdf ? " (from pushed PDF)" : ""));
   db.event(con, "batch-start", `ingesting ${images.length} page(s)`, { batch });
 
   const workdir = path.join(cfg.data_root, "tmp", batch);
@@ -103,7 +120,8 @@ async function ingestBatch(cfg, con, batchDir) {
   let dest = null;
   try {
     const rawPdf = path.join(workdir, "raw.pdf");
-    await ocr.imagesToPdf(images, rawPdf);
+    if (srcPdf) fs.copyFileSync(srcPdf, rawPdf);
+    else await ocr.imagesToPdf(images, rawPdf);
     const info = con.prepare(
       `INSERT INTO documents(created_at, pages, batch, status, pending)
        VALUES (?,?,?,'inbox','queued')`
@@ -351,6 +369,19 @@ async function processBatch(cfg, con, batchDir) {
   return processDocument(cfg, con, docId, batchDir);
 }
 
+function moveSync(src, dest) {
+  // rename(2) fails with EXDEV across filesystems (scans_dir lives on
+  // /home, data_root on /pool) -- fall back to copy+delete like
+  // Python's shutil.move did
+  try {
+    fs.renameSync(src, dest);
+  } catch (e) {
+    if (e.code !== "EXDEV") throw e;
+    fs.cpSync(src, dest, { recursive: true });
+    fs.rmSync(src, { recursive: true, force: true });
+  }
+}
+
 function finishBatch(cfg, batchDir, success, keep = null) {
   // Move originals to originals/ (or failed/), per config. keep=true
   // forces keeping (watcher ingest: the background stage still needs the
@@ -360,14 +391,14 @@ function finishBatch(cfg, batchDir, success, keep = null) {
   if (!success) {
     const dest = path.join(cfg.data_root, "failed", batch);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.renameSync(batchDir, dest);
+    moveSync(batchDir, dest);
     return dest;
   }
   if (keep === null) keep = cfg.keep_originals ?? true;
   if (keep) {
     const dest = path.join(cfg.data_root, "originals", batch);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.renameSync(batchDir, dest);
+    moveSync(batchDir, dest);
     return dest;
   }
   fs.rmSync(batchDir, { recursive: true, force: true });
