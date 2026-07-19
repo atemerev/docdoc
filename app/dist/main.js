@@ -239,23 +239,27 @@ electron_1.ipcMain.handle("open-folder", async (_e, id) => {
 });
 // single instance: a second launch (autostart + manual, or a debug run)
 // must never start a second watcher against the live DB -- it focuses
-// the existing instance instead
+// the existing instance instead. app.quit() is asynchronous, so the
+// whole startup is gated on holding the lock (a denied instance must
+// not even create its tray icon).
 if (!electron_1.app.requestSingleInstanceLock()) {
-    electron_1.app.quit();
+    electron_1.app.exit(0);
 }
-electron_1.app.on("second-instance", () => { void showWindow(); });
-void electron_1.app.whenReady().then(async () => {
-    registerProtocol();
-    api = new api_1.Api();
-    dataRoot = api.cfg.data_root;
-    startChangePoller();
-    setupTray();
-    setupAutostart();
-    watcher.start();
-    if (!process.argv.includes("--hidden"))
-        await createWindow();
-    electron_1.app.on("activate", () => { void showWindow(); });
-});
+else {
+    electron_1.app.on("second-instance", () => { void showWindow(); });
+    void electron_1.app.whenReady().then(async () => {
+        registerProtocol();
+        api = new api_1.Api();
+        dataRoot = api.cfg.data_root;
+        startChangePoller();
+        setupTray();
+        setupAutostart();
+        watcher.start();
+        if (!process.argv.includes("--hidden"))
+            await createWindow();
+        electron_1.app.on("activate", () => { void showWindow(); });
+    });
+}
 electron_1.app.on("before-quit", () => {
     globalThis.isQuitting = true;
     scanner.stop();

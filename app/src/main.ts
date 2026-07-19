@@ -226,23 +226,25 @@ ipcMain.handle("open-folder", async (_e, id: number) => {
 
 // single instance: a second launch (autostart + manual, or a debug run)
 // must never start a second watcher against the live DB -- it focuses
-// the existing instance instead
+// the existing instance instead. app.quit() is asynchronous, so the
+// whole startup is gated on holding the lock (a denied instance must
+// not even create its tray icon).
 if (!app.requestSingleInstanceLock()) {
-  app.quit();
+  app.exit(0);
+} else {
+  app.on("second-instance", () => { void showWindow(); });
+  void app.whenReady().then(async () => {
+    registerProtocol();
+    api = new Api();
+    dataRoot = api.cfg.data_root;
+    startChangePoller();
+    setupTray();
+    setupAutostart();
+    watcher.start();
+    if (!process.argv.includes("--hidden")) await createWindow();
+    app.on("activate", () => { void showWindow(); });
+  });
 }
-app.on("second-instance", () => { void showWindow(); });
-
-void app.whenReady().then(async () => {
-  registerProtocol();
-  api = new Api();
-  dataRoot = api.cfg.data_root;
-  startChangePoller();
-  setupTray();
-  setupAutostart();
-  watcher.start();
-  if (!process.argv.includes("--hidden")) await createWindow();
-  app.on("activate", () => { void showWindow(); });
-});
 
 app.on("before-quit", () => {
   globalThis.isQuitting = true;
