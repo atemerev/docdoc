@@ -1,68 +1,49 @@
 // docdoc Electron main process.
 //
-// Architecture: all data work lives in the Python side (docdoc.server,
-// spawned here as a child process speaking JSON-lines over stdio); the
+// Architecture: single app, no external services. All data work runs
+// in-process (lib/api.js over better-sqlite3); heavy work (OCR, AI,
+// scanning) is spawned as child processes by the pipeline modules. The
 // renderer is pure sandboxed UI talking through the preload bridge.
 // App files and document bytes are served over the app:// scheme so the
 // renderer runs on a proper secure origin (pdf.js workers, fetch, etc.).
 
 const { app, BrowserWindow, ipcMain, protocol, net, shell, Notification } =
   require("electron");
-const { spawn } = require("child_process");
 const path = require("path");
-const readline = require("readline");
 const { pathToFileURL } = require("url");
 
-const REPO_ROOT = path.resolve(__dirname, "..");
-const PYTHON = "/usr/bin/python3";
+const { Api } = require("./lib/api");
 
 let win = null;
-let server = null;
+let api = null;
 let dataRoot = null;
-const pending = new Map();
-let nextId = 1;
 
-// ---------------------------------------------------------------- server
-function startServer() {
-  server = spawn(PYTHON, ["-m", "docdoc.server"], {
-    cwd: REPO_ROOT,
-    env: { ...process.env, PYTHONPATH: REPO_ROOT },
-    stdio: ["pipe", "pipe", "inherit"],
-  });
-  const rl = readline.createInterface({ input: server.stdout });
-  rl.on("line", (line) => {
-    let msg;
-    try { msg = JSON.parse(line); } catch { return; }
-    if (msg.id !== undefined && pending.has(msg.id)) {
-      const { resolve, reject } = pending.get(msg.id);
-      pending.delete(msg.id);
-      msg.error ? reject(new Error(msg.error)) : resolve(msg.result);
-    } else if (msg.event) {
-      if (win && !win.isDestroyed()) win.webContents.send("docdoc-event", msg);
-    }
-  });
-  server.on("exit", (code) => {
-    for (const { reject } of pending.values())
-      reject(new Error("docdoc server exited"));
-    pending.clear();
-    if (!app.isQuitting) setTimeout(startServer, 2000);
-  });
+// ---------------------------------------------------------------- api
+async function call(method, params) {
+  if (!api) throw new Error("api not ready");
+  const fn = api[method];
+  if (typeof fn !== "function" || method.startsWith("_"))
+    throw new Error(`unknown method '${method}'`);
+  return fn.call(api, params || {});
 }
 
-function call(method, params) {
-  return new Promise((resolve, reject) => {
-    if (!server || server.exitCode !== null)
-      return reject(new Error("docdoc server not running"));
-    const id = nextId++;
-    pending.set(id, { resolve, reject });
-    server.stdin.write(JSON.stringify({ id, method, params }) + "\n");
-    setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error(`${method} timed out`));
-      }
-    }, 120000);
-  });
+// Push {event:'changed'} to the renderer when any process commits to the
+// DB (PRAGMA data_version changes on foreign commits -- covers the legacy
+// Python daemons during the migration and any external writers after).
+let lastDataVersion = null;
+function startChangePoller() {
+  setInterval(() => {
+    try {
+      const v = api.con.pragma("data_version", { simple: true });
+      if (lastDataVersion !== null && v !== lastDataVersion)
+        sendEvent({ event: "changed" });
+      lastDataVersion = v;
+    } catch {}
+  }, 1000);
+}
+
+function sendEvent(msg) {
+  if (win && !win.isDestroyed()) win.webContents.send("docdoc-event", msg);
 }
 
 // ---------------------------------------------------------------- app://
@@ -168,13 +149,9 @@ ipcMain.handle("open-folder", async (_e, id) => {
 
 app.whenReady().then(async () => {
   registerProtocol();
-  startServer();
-  try {
-    const cfg = await call("get_settings", {});
-    dataRoot = cfg.data_root;
-  } catch (e) {
-    dataRoot = "/pool/docdoc";
-  }
+  api = new Api();
+  dataRoot = api.cfg.data_root;
+  startChangePoller();
   await createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -184,5 +161,4 @@ app.whenReady().then(async () => {
 app.on("before-quit", () => { app.isQuitting = true; });
 app.on("window-all-closed", () => {
   app.quit();
-  if (server) server.kill();
 });
