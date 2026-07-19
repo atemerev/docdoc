@@ -134,18 +134,36 @@ otherwise shadow the claude.ai subscription.
   the original invoice, raise its amount due by the Mahngebühr, move the
   due date, and set status `reminded`. Paying any chain member settles all.
 
+## Code layout (TypeScript, `app/src/`)
+
+- `domain/` — pure logic, no I/O: the type model (`types.ts`), Swiss
+  QR-bill parsing/validation, page-order markers, text similarity.
+- `infra/` — adapters: SQLite (better-sqlite3), config, CLI execution
+  with the abort registry, OCR tools, QR codec (zbarimg/qrencode),
+  pure-JS imaging, notifications.
+- `services/` — orchestration: extraction (AI providers + prompt +
+  normalize), pipeline, invoices lifecycle, dedup, watcher, scanner.
+- `api/` — the renderer-facing facade; `main.ts` — Electron main
+  (tray, single-instance lock, app:// protocol, autostart).
+- `renderer/` — the sandboxed UI (bundled by esbuild to
+  `renderer/app.js`); `tests/` — the four suites + fixtures.
+
+`npm run build` compiles everything (tsc → `dist/`, esbuild for the
+renderer); `npm start` builds and launches.
+
 ## Testing
 
-`cd app && npm test` — four suites, run under Electron's Node runtime
-(better-sqlite3 is built for Electron's ABI):
+`cd app && npm test` — builds, then runs four suites under Electron's
+Node runtime (better-sqlite3 is built for Electron's ABI):
 
-- `tests/test_qrbill.js` — QR-bill parser round trip through real QR images
-- `tests/test_invoices.js` — invoice chains, bank accounts, IBAN checks
-- `tests/test_blank.js` — blank-backside detection with synthetic ADF artifacts
-- `tests/test_pipeline.js` — full pipeline e2e on synthetic fixtures
-  (`tests/make_fixtures.js`), isolated temp data root
+- `test_qrbill` — QR-bill parser round trip through real QR images
+- `test_invoices` — invoice chains, bank accounts, IBAN checks
+- `test_blank` — blank-backside detection with synthetic ADF artifacts
+- `test_pipeline` — full pipeline e2e on synthetic fixtures, isolated
+  temp data root, including multi-document stack splitting
 
-`DOCDOC_SHOT=/tmp/x.png npx electron .` — app screenshot for debugging.
+`DOCDOC_SHOT=/tmp/x.png npx electron .` — app screenshot for debugging
+(quit the tray instance first; the single-instance lock yields to it).
 
 ## Known quirks
 

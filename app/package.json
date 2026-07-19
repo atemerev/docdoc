@@ -1,17 +1,23 @@
 {
   "name": "docdoc",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "AI-enabled document scanning and management platform",
-  "main": "main.js",
+  "main": "dist/main.js",
   "scripts": {
-    "start": "electron .",
-    "test": "for t in qrbill invoices blank pipeline; do ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron ../tests/test_$t.js || exit 1; done",
+    "build": "tsc && tsc -p tsconfig.renderer.json && esbuild src/renderer/app.ts --bundle --format=esm --outfile=renderer/app.js --external:./pdfjs/pdf.mjs --log-level=warning",
+    "start": "npm run build && electron .",
+    "test": "npm run build && for t in qrbill invoices blank pipeline; do ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron dist/tests/test_$t.js || exit 1; done",
     "postinstall": "electron-rebuild -f -w better-sqlite3"
   },
   "license": "MIT",
   "devDependencies": {
     "@electron/rebuild": "^4.2.0",
-    "electron": "^37.0.0"
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.1.1",
+    "@types/pngjs": "^6.0.5",
+    "electron": "^37.0.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
