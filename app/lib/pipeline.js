@@ -215,8 +215,9 @@ async function understand(cfg, con, doc, images, rawPdf, workdir) {
   if (blanks.size) flags.push(`blank-dropped:${blanks.size}`);
 
   // 4. AI understanding -- the model *reads* the page images (in scan
-  // order) and reports metadata, internal references AND the correct
-  // reading order. Regex heuristics only run in no-AI degraded mode.
+  // order) and reports metadata, internal references, the correct
+  // reading order AND whether the stack is really several documents.
+  // Regex heuristics only run in no-AI degraded mode.
   const known = con.prepare("SELECT key FROM senders").all().map((r) => r.key);
   const scanContent = kept.map((i) => pageTexts[i]).join("\n\f\n");
   progress(cfg, batch, "ai", "AI reading the document", 58, 90);
@@ -226,6 +227,59 @@ async function understand(cfg, con, doc, images, rawPdf, workdir) {
   checkAbort();  // a killed AI falls back to heuristics -- don't file that
   log(`pipeline: ${batch}: [${provider}] ${ext.doc_type} from `
       + `${ext.sender_name}: '${ext.title}'`);
+
+  // 4b. several documents fed as one stack? validate the grouping: the
+  // groups must exactly partition the kept pages, else file as one and
+  // leave a flag for the review queue
+  let groups = null;
+  if (Array.isArray(ext.page_groups) && ext.page_groups.length > 1) {
+    const flat = ext.page_groups.flat().sort((a, b) => a - b);
+    const identity1 = Array.from({ length: kept.length }, (_, i) => i + 1);
+    if (JSON.stringify(flat) === JSON.stringify(identity1))
+      groups = ext.page_groups;
+    else flags.push("multi-doc-uncertain:bad-groups");
+  }
+
+  if (groups) {
+    log(`pipeline: ${batch}: stack contains ${groups.length} documents `
+        + JSON.stringify(groups));
+    db.event(con, "info",
+             `stack split into ${groups.length} documents`,
+             { batch, documentId: docId });
+    for (let gi = 0; gi < groups.length; gi++) {
+      checkAbort();
+      // groups reference positions among the pages the model saw (kept),
+      // each group already in reading order
+      const scanIdxs = groups[gi].map((p) => kept[p - 1]);
+      const subTexts = scanIdxs.map((i) => pageTexts[i]);
+      const subImages = scanIdxs.map((i) => imgs[i]).filter(Boolean);
+      // each part gets its own QR detection (two invoices = possibly two
+      // QR-bills) and its own extraction over only its pages -- the
+      // stack-level call above only established the grouping
+      const subQr = subImages.length ? await qrbill.findQrbill(subImages) : null;
+      progress(cfg, batch, "ai",
+               `AI reading document ${gi + 1}/${groups.length}`,
+               58 + Math.round((gi / groups.length) * 32), 90);
+      const sub = await ai.extract(cfg, subImages, subTexts.join("\n\f\n"),
+                                   { qr: subQr, knownSenders: known });
+      checkAbort();
+      let rowDoc = doc;
+      if (gi > 0) {
+        const info = con.prepare(
+          `INSERT INTO documents(created_at, pages, batch, status, pending)
+           VALUES (?,?,?,'inbox','queued')`
+        ).run(db.nowIso(), scanIdxs.length, batch);
+        rowDoc = con.prepare("SELECT * FROM documents WHERE id=?")
+          .get(Number(info.lastInsertRowid));
+      }
+      const partPdf = path.join(workdir, `part-${gi}.pdf`);
+      await ocr.rebuildPdf(ocrPdfPath, partPdf, scanIdxs.map((i) => i + 1));
+      await fileDocument(cfg, con, rowDoc, sub.ext, subQr, partPdf,
+        scanIdxs, subTexts, gi === 0 ? blanks : new Set(),
+        [...flags, `multi-doc:${gi + 1}/${groups.length}`], pageTexts);
+    }
+    return docId;
+  }
 
   // 5. page order: AI judgement, page-number markers as cross-check
   const { order: markerOrder, flags: oflags } =
@@ -256,7 +310,18 @@ async function understand(cfg, con, doc, images, rawPdf, workdir) {
     await ocr.rebuildPdf(ocrPdfPath, finalPdf, kept.map((i) => i + 1));
   else finalPdf = ocrPdfPath;
 
-  const keptTexts = kept.map((i) => pageTexts[i]);
+  await fileDocument(cfg, con, doc, ext, qr, finalPdf, kept,
+    kept.map((i) => pageTexts[i]), blanks, flags, pageTexts);
+  return docId;
+}
+
+async function fileDocument(cfg, con, doc, ext, qr, finalPdf, kept,
+                            keptTexts, blanks, flags, pageTexts) {
+  // File one logical document: dedup, sender, archive move, metadata,
+  // refs, pages, invoice lifecycle, event. `kept` holds 0-based scan
+  // indices in final reading order; `doc` is the (possibly freshly
+  // inserted) documents row to fill in.
+  const docId = doc.id, batch = doc.batch;
   const content = keptTexts.join("\n\f\n");
 
   // 6. dedup (on the final ordered content)

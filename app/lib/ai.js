@@ -71,6 +71,15 @@ Output ONLY a JSON object, no prose, no code fences, with exactly these keys:
   correct reading order; otherwise the correct order as a list of 1-based
   positions, e.g. [2,1,3] means the 2nd image is really page 1. Judge from
   content flow, page numbering, letterhead/signature placement.
+- page_groups: null if all pages belong to ONE document. If the scanned
+  stack contains MULTIPLE separate documents (e.g. two unrelated invoices
+  fed in one go), an array of page-number arrays, one per document, each
+  in reading order — e.g. [[1,2],[3]] = pages 1-2 form one document,
+  page 3 another. A payment slip belongs to its invoice's group, and
+  continuation pages are not separate documents — split only on a clear
+  new document start (new letterhead/sender/date/subject). When you
+  report page_groups, fill all other fields for the FIRST group's
+  document.
 `;
 
 function slugify(name) {
@@ -143,6 +152,16 @@ function normalize(d, qr = null) {
         JSON.stringify(sorted) === JSON.stringify(identity) &&
         JSON.stringify(order) !== JSON.stringify(identity))
       out.page_order = order;
+  }
+  // multiple documents in one scanned stack: array of 1-based page-number
+  // arrays; shape-sanitized here, completeness validated by the pipeline
+  // (which knows the page count)
+  out.page_groups = null;
+  if (Array.isArray(d.page_groups) && d.page_groups.length > 1) {
+    const groups = d.page_groups.map((g) => Array.isArray(g)
+      ? g.map((x) => parseInt(x, 10)).filter((x) => Number.isFinite(x) && x >= 1)
+      : []);
+    if (groups.every((g) => g.length)) out.page_groups = groups;
   }
   // QR-bill data is authoritative where present
   if (qr) {
@@ -241,6 +260,8 @@ const EXTRACTION_SCHEMA = {
       properties: { date: { type: "string" }, label: { type: "string" } },
       required: ["date", "label"], additionalProperties: false } },
     page_order: { type: ["array", "null"], items: { type: "integer" } },
+    page_groups: { type: ["array", "null"],
+      items: { type: "array", items: { type: "integer" } } },
   },
   required: ["doc_type", "sender_name", "sender_key", "title", "language",
              "summary_en", "tags", "amount", "currency", "refs"],

@@ -82,3 +82,7 @@
 11. **Mobile companion / share links**, document versions, audit trail.
 12. **PDF/A verification + jbig2 compression** (build jbig2enc) for
     smaller archives.
+- **Multi-document stacks**: when several documents are fed as one scan
+  (e.g. two invoices), the AI reports the page grouping; the pipeline
+  splits the PDF, re-extracts each part with its own QR-bill, and files
+  them as separate documents with their own invoice records.

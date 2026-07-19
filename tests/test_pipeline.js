@@ -108,6 +108,81 @@ async function main() {
       "SELECT COUNT(*) c FROM invoices").get().c;
     check("duplicate created no extra invoice row", nInv === 2, `(got ${nInv})`);
 
+    console.log("== two documents in one scanned stack ==");
+    // detection needs a model; stub the extractor to test the split
+    // mechanics (partitioned PDFs, per-part rows/invoices/refs) exactly
+    const ai = require(path.join(LIB, "ai.js"));
+    const realExtract = ai.extract;
+    let calls = 0;
+    ai.extract = async (c, images, text, opts) => {
+      calls++;
+      const base = { language: "de", tags: ["test"], refs: [] };
+      if (calls === 1)                      // stack-level: report the split
+        return { ext: ai.normalize({ ...base, doc_type: "other",
+          sender_name: "stack", page_groups: [[1], [2]] }, opts.qr),
+          provider: "stub" };
+      const who = calls === 2
+        ? { sender_name: "Alpha Versicherung AG", amount: 111.10,
+            invoice_ref: "ALPHA-1", title: "Rechnung Alpha" }
+        : { sender_name: "Beta Energie SA", amount: 222.20,
+            invoice_ref: "BETA-2", title: "Facture Beta" };
+      return { ext: ai.normalize({ ...base, doc_type: "invoice",
+        doc_date: "2026-07-01", ...who,
+        refs: [{ kind: "invoice_no", value: who.invoice_ref }] }, opts.qr),
+        provider: "stub" };
+    };
+    try {
+      const stackDir = path.join(td, "in", "fixture-stack");
+      fs.mkdirSync(stackDir, { recursive: true });
+      // unique pages (reusing earlier fixtures would trip exact-text dedup)
+      fs.writeFileSync(path.join(stackDir, "page-001.png"),
+        await fixtures.page([
+          [180, 160, 64, true, "Alpha Versicherung AG"],
+          [180, 860, 56, true, "Rechnung ALPHA-1"],
+          [180, 1400, 44, false, "Praemie total: CHF 111.10"],
+        ]));
+      fs.writeFileSync(path.join(stackDir, "page-002.png"),
+        await fixtures.page([
+          [180, 160, 64, true, "Beta Energie SA"],
+          [180, 860, 56, true, "Facture BETA-2"],
+          [180, 1400, 44, false, "Montant total: CHF 222.20"],
+        ]));
+      const primary = await pipeline.processBatch(cfg, con, stackDir);
+      const parts = con.prepare(
+        "SELECT * FROM documents WHERE batch='fixture-stack' ORDER BY id").all();
+      check("stack produced two documents", parts.length === 2,
+            `(got ${parts.length})`);
+      check("first part keeps the ingested row", parts[0]?.id === primary);
+      check("both parts fully processed",
+            parts.every((p) => p.pending === null));
+      check("one page each",
+            parts.every((p) => p.pages === 1),
+            parts.map((p) => p.pages).join(","));
+      check("distinct senders",
+            parts[0]?.sender_name?.includes("Alpha")
+            && parts[1]?.sender_name?.includes("Beta"),
+            parts.map((p) => p.sender_name).join(" | "));
+      check("distinct archive PDFs exist",
+            parts.every((p) => fs.existsSync(
+              path.join(td, "archive", p.pdf_path)))
+            && parts[0].pdf_path !== parts[1].pdf_path);
+      check("multi-doc flags set",
+            JSON.parse(parts[0].flags).includes("multi-doc:1/2")
+            && JSON.parse(parts[1].flags).includes("multi-doc:2/2"));
+      const stackInvs = con.prepare(
+        `SELECT i.* FROM invoices i JOIN documents d ON d.id=i.document_id
+         WHERE d.batch='fixture-stack' ORDER BY i.id`).all();
+      check("an invoice row per part", stackInvs.length === 2
+            && stackInvs[0].amount === 111.10 && stackInvs[1].amount === 222.20,
+            stackInvs.map((i) => i.amount).join(","));
+      check("parts have their own page rows",
+            parts.every((p) => con.prepare(
+              "SELECT COUNT(*) c FROM pages WHERE document_id=?"
+            ).get(p.id).c === 1));
+    } finally {
+      ai.extract = realExtract;
+    }
+
     console.log("== originals + events ==");
     pipeline.finishBatch(cfg, mahDir, true, true);
     check("finishBatch moves batch to originals/",

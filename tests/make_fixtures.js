@@ -115,4 +115,4 @@ async function main(outdir) {
 if (require.main === module)
   main(process.argv[2] || ".").catch((e) => { console.error(e); process.exit(1); });
 
-module.exports = { invoicePage, mahnungPage, IBAN, QRR };
+module.exports = { page, invoicePage, mahnungPage, IBAN, QRR };
