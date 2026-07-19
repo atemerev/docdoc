@@ -1,0 +1,12 @@
+[Unit]
+Description=docdoc document processing daemon (watches scan batches)
+
+[Service]
+ExecStart=/usr/bin/python3 -m docdoc.watchd
+WorkingDirectory=/home/aryeh/devel/docdoc
+Environment=PYTHONPATH=/home/aryeh/devel/docdoc
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' app:; img-src 'self' app: data:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <title>docdoc</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="root">
+    <div id="app-row">
+      <nav id="sidebar">
+        <div class="brand">doc<span>doc</span></div>
+        <button class="nav" data-view="inbox">Inbox <span class="count" id="count-inbox"></span></button>
+        <button class="nav" data-view="documents">Documents <span class="count" id="count-docs"></span></button>
+        <button class="nav" data-view="invoices">Invoices <span class="count warn" id="count-unpaid"></span></button>
+        <button class="nav" data-view="senders">Senders</button>
+        <button class="nav" data-view="accounts">Bank accounts</button>
+        <button class="nav" data-view="activity">Activity</button>
+        <button class="nav" data-view="settings">Settings</button>
+        <button id="scan-btn" title="Load paper into the feeder and click">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/>
+            <path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+          </svg>
+          Scan
+        </button>
+      </nav>
+      <div id="main">
+        <header id="topbar">
+          <input id="search" type="search" placeholder="Search everything… (sender, content, reference)" autocomplete="off">
+          <div id="status"></div>
+        </header>
+        <section id="content"></section>
+      </div>
+      <aside id="detail" class="hidden"></aside>
+    </div>
+    <footer id="statusbar">
+      <span id="sb-stats"></span>
+      <span class="sb-right">
+        <span class="sb-daemon" id="sb-scanner" title="scan-buttond — scanner daemon">
+          <span class="sb-dot"></span>scanner</span>
+        <span class="sb-daemon" id="sb-watcher" title="docdocd — batch processing daemon">
+          <span class="sb-dot"></span>processing</span>
+      </span>
+    </footer>
+  </div>
+  <div id="modal" class="hidden"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
