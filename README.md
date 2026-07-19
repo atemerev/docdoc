@@ -64,23 +64,30 @@ System dependencies (spawned as CLIs): `tesseract` + tessdata_best,
 
 ## Scanner button setup (one-time, zero polling)
 
-The ADS-4300N's three **Network Device Scan Buttons** push finished scans
-(multipage PDF) to the PC entirely in firmware — no daemon watches the
-paper sensor. See RESEARCH.md "Zero-polling button scanning" for the full
-findings. Short version:
+The ADS-4300N's three **Network Device Scan Buttons** work entirely in
+firmware over the network — no daemon watches the paper sensor. See
+RESEARCH.md "Zero-polling button scanning" for the findings.
 
-1. Connect the scanner's Ethernet port; give it a DHCP reservation.
-2. sshd on this machine: keep an **RSA host key** enabled (the Brother
-   SFTP client doesn't speak ed25519) and create a chrooted `scan` user
-   whose directory is bind-mounted/pointed at `~/Scans`.
-3. In the scanner's Web Based Management (`https://<scanner-ip>`):
-   Scan → Scan to Network Device → Button 1 → Scan to SFTP profile
-   (multipage PDF, filename prefix + date/counter).
-4. Done: paper in, press button 1; the watcher picks the PDF up via
-   inotify, renders page images and runs the normal pipeline.
+**No router needed**: the scanner plugs **directly into the PC's spare
+Ethernet port** (enp36s0f0). A NetworkManager shared-mode profile
+(`docdoc-scanner`) is pre-configured: on link-up the PC becomes
+10.42.0.1/24 with DHCP, and the scanner picks an address automatically.
+Just run a cable scanner-LAN → PC port.
 
-USB stays connected in parallel for the app's own Scan button
-(`scanimage` over eSCL/ipp-usb).
+Two button transports (USB stays connected in parallel for the app's own
+Scan button via scanimage/eSCL):
+
+- **WS Scan (preferred, true push)** — the same open Microsoft WSD
+  protocol Windows uses driverlessly: docdoc registers as a scan
+  destination via WS-Eventing, appears by name on the scanner's panel,
+  and receives a ScanAvailableEvent when the button is pressed
+  (implementation pending — needs the cable connected to test against
+  the real firmware).
+- **Scan to SFTP (fallback)** — firmware pushes a multipage PDF: keep an
+  **RSA host key** enabled in sshd (the Brother SFTP client doesn't
+  speak ed25519), chroot a `scan` user at `~/Scans`, and configure the
+  profile in Web Based Management (`https://10.42.0.x`) → Scan → Scan to
+  Network Device → Button 1. The watcher picks the PDF up via inotify.
 
 ## Storage layout (`/pool/docdoc`, symlinked as `~/DocDoc`)
 
