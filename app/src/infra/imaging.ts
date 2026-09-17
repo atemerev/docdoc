@@ -86,3 +86,106 @@ export function isBlank(
     return !(pageText ?? "").trim();
   }
 }
+
+/** Conservative pre-OCR check: keep sparse writing, including headers/footers.
+ * Unlike the post-OCR coverage heuristic, this must not depend on recognized
+ * text or blur small letters away. Only edge-connected scanner shadows, tiny
+ * specks, and broad light stains/creases are ignored. Unreadable images stay.
+ */
+export function isBlankBeforeOcr(imagePath: string, existingText = ""): boolean {
+  if (existingText.trim()) return false;
+  try {
+    const { data, width, height } = decodeGray(imagePath);
+    const scale = Math.max(1, Math.ceil(Math.max(width, height) / 1200));
+    const w = Math.floor(width / scale), h = Math.floor(height / scale);
+    if (w < 20 || h < 20) return false;
+    const gray = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let sum = 0;
+        for (let dy = 0; dy < scale; dy++)
+          for (let dx = 0; dx < scale; dx++)
+            sum += data[(y * scale + dy) * width + x * scale + dx];
+        gray[y * w + x] = sum / (scale * scale);
+      }
+    const seen = new Uint8Array(w * h), queue = new Int32Array(w * h);
+    const smallMarks: { x: number; y: number; height: number }[] = [];
+    // Remove edge-connected scanner background within the margins first. A
+    // light fold can touch a dark border; its interior must be judged separately.
+    let edgeHead = 0, edgeTail = 0;
+    const seed = (x: number, y: number) => {
+      const at = y * w + x;
+      if (!seen[at] && gray[at] < 225) { seen[at] = 1; queue[edgeTail++] = at; }
+    };
+    for (let x = 0; x < w; x++) { seed(x, 0); seed(x, h - 1); }
+    for (let y = 0; y < h; y++) { seed(0, y); seed(w - 1, y); }
+    while (edgeHead < edgeTail) {
+      const at = queue[edgeHead++], x = at % w, y = Math.floor(at / w);
+      for (let ny = Math.max(0, y - 1); ny <= Math.min(h - 1, y + 1); ny++)
+        for (let nx = Math.max(0, x - 1); nx <= Math.min(w - 1, x + 1); nx++)
+          if (!(nx > w * 0.08 && nx < w * 0.92 && ny > h * 0.08 && ny < h * 0.92)) seed(nx, ny);
+    }
+    // Real folded sheets produce broken light components along a broad crease.
+    // A nearly continuous shaded row distinguishes these from faint lettering.
+    const foldRows: number[] = [];
+    for (let y = Math.round(h * 0.1); y < h * 0.9; y += 4) {
+      let shaded = 0;
+      for (let x = Math.round(w * 0.08); x < w * 0.92; x++) {
+        let count = 0;
+        for (let dy = -8; dy <= 8; dy++) if (gray[(y + dy) * w + x] < 242) count++;
+        if (count >= 3) shaded++;
+      }
+      if (shaded > w * 0.70) foldRows.push(y);
+    }
+    for (let start = 0; start < gray.length; start++) {
+      if (seen[start] || gray[start] >= 225) continue;
+      let head = 0, tail = 1, darkest = 255, interior = 0;
+      let left = w, right = 0, top = h, bottom = 0;
+      queue[0] = start;
+      seen[start] = 1;
+      while (head < tail) {
+        const at = queue[head++], x = at % w, y = Math.floor(at / w);
+        left = Math.min(left, x); right = Math.max(right, x);
+        top = Math.min(top, y); bottom = Math.max(bottom, y);
+        darkest = Math.min(darkest, gray[at]);
+        if (x > w * 0.08 && x < w * 0.92 && y > h * 0.08 && y < h * 0.92) interior++;
+        for (let ny = Math.max(0, y - 1); ny <= Math.min(h - 1, y + 1); ny++)
+          for (let nx = Math.max(0, x - 1); nx <= Math.min(w - 1, x + 1); nx++) {
+            const next = ny * w + nx;
+            if (!seen[next] && gray[next] < 225) {
+              seen[next] = 1;
+              queue[tail++] = next;
+            }
+          }
+      }
+      const cw = right - left + 1, ch = bottom - top + 1;
+      // Ignore a shadow only when it touches an edge and stays in its margin.
+      // Detached marks there can be a page number or a short handwritten note.
+      const edgeShadow = !interior && (left === 0 || right === w - 1 || top === 0 || bottom === h - 1);
+      // Small, solid printer registration blocks at the side of a blank back.
+      // Do not discard detached letters/page numbers in the top/bottom margin.
+      const registration = (right < w * 0.05 || left > w * 0.95) &&
+        cw >= 3 && ch >= 3 && cw < w * 0.03 && ch < h * 0.03 && tail / (cw * ch) > 0.82;
+      if (edgeShadow || registration || tail < 6 || Math.max(cw, ch) < 3) continue;
+      if (darkest >= 175) {
+        if (ch < h * 0.03 && foldRows.some((y) => top >= y - h * 0.02 && bottom <= y + h * 0.02)) continue;
+        const crease = (cw > w * 0.75 && ch < h * 0.02) ||
+          (ch > h * 0.75 && cw < w * 0.02);
+        const stain = cw > 10 && ch > 10 && tail < w * h * 0.005 &&
+          tail / (cw * ch) > 0.65;
+        if (crease || stain) continue;
+      }
+      if (tail < 12 || (darkest > 150 && tail < 30)) {
+        smallMarks.push({ x: (left + right) / 2, y: (top + bottom) / 2, height: ch });
+        continue;
+      }
+      return false;
+    }
+    // Dust is isolated. Even low-contrast lettering forms a nearby row of marks.
+    if (smallMarks.some((a) => smallMarks.filter((b) =>
+      Math.abs(a.y - b.y) <= Math.max(a.height, b.height) && Math.abs(a.x - b.x) < w * 0.1).length >= 3)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}

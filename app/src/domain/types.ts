@@ -8,28 +8,51 @@
 
 // ------------------------------------------------------------ vocabulary
 export const DOC_TYPES = [
-  "invoice", "reminder", "receipt", "letter", "contract", "policy",
-  "statement", "return_slip", "medical", "insurance", "tax", "other",
+  "pursuit",
+  "invoice",
+  "reminder",
+  "receipt",
+  "letter",
+  "contract",
+  "policy",
+  "statement",
+  "return_slip",
+  "medical",
+  "insurance",
+  "tax",
+  "other",
 ] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
 export const REF_KINDS = [
-  "invoice_no", "customer_no", "policy_no", "contract_no", "case_no",
-  "member_no", "order_no", "qr_reference", "other",
+  "pursuit_no",
+  "debt_certificate_no",
+  "office_ref",
+  "claim_no",
+  "invoice_no",
+  "customer_no",
+  "policy_no",
+  "contract_no",
+  "case_no",
+  "member_no",
+  "order_no",
+  "qr_reference",
+  "other",
 ] as const;
 export type RefKind = (typeof REF_KINDS)[number];
 
 export type DocStatus = "inbox" | "filed" | "trash";
 export type InvoiceStatus = "open" | "reminded" | "paid" | "void";
 export type PendingState = "queued" | "error" | null;
-export type AiProvider = "claude-cli" | "local-vllm" | "none";
-export type ExtractionProvider = "claude-cli" | "local-vllm" | "heuristic";
 
 // ------------------------------------------------------------ DB rows
 export interface DocumentRow {
   id: number;
   created_at: string;
   doc_date: string | null;
+  scanned_at: string | null;
+  scan_date_source: string | null;
+  case_opened_date: string | null;
   title: string | null;
   doc_type: DocType | null;
   sender_id: number | null;
@@ -37,12 +60,12 @@ export interface DocumentRow {
   recipient: string | null;
   language: string | null;
   summary: string | null;
-  tags: string;                    // JSON array
+  tags: string; // JSON array
   tags_text: string;
-  pdf_path: string | null;         // relative to <data_root>/archive
+  pdf_path: string | null; // relative to <data_root>/archive
   thumb_path: string | null;
   pages: number | null;
-  content: string | null;          // full OCR text
+  content: string | null; // full OCR text
   file_sha256: string | null;
   text_hash: string | null;
   batch: string | null;
@@ -55,14 +78,14 @@ export interface DocumentRow {
   due_date: string | null;
   invoice_ref: string | null;
   ai_json: string | null;
-  flags: string;                   // JSON array
+  flags: string; // JSON array
   pending: PendingState;
 }
 
 export interface PageRow {
   id: number;
   document_id: number;
-  page_no: number | null;          // null = dropped blank
+  page_no: number | null; // null = dropped blank
   scan_order: number;
   text: string | null;
   is_blank: number;
@@ -75,7 +98,7 @@ export interface SenderRow {
   name: string;
   uid: string | null;
   iban: string | null;
-  address: string | null;          // JSON address
+  address: string | null; // JSON address
   notes: string | null;
 }
 
@@ -92,9 +115,9 @@ export interface InvoiceRow {
   qr_iban: string | null;
   qr_ref_type: string | null;
   qr_reference: string | null;
-  qr_creditor: string | null;      // JSON address
+  qr_creditor: string | null; // JSON address
   qr_payload: string | null;
-  swico: string | null;            // JSON SwicoS1
+  swico: string | null; // JSON SwicoS1
   is_notification: number;
   reminder_level: number;
   parent_invoice_id: number | null;
@@ -120,7 +143,12 @@ export interface DocRefRow {
 }
 
 export type EventKind =
-  "batch-start" | "document" | "error" | "invoice" | "info" | "abort";
+  | "batch-start"
+  | "document"
+  | "error"
+  | "invoice"
+  | "info"
+  | "abort";
 
 export interface EventRow {
   id: number;
@@ -135,7 +163,7 @@ export interface EventRow {
 export interface QrAddress {
   name: string;
   country: string | null;
-  type: string | null;             // 'S' structured | 'K' combined (legacy)
+  type: string | null; // 'S' structured | 'K' combined (legacy)
   street?: string | null;
   building?: string | null;
   postal_code?: string | null;
@@ -169,7 +197,7 @@ export interface QrBill {
   swico: SwicoS1 | null;
   alt_procedures: string[];
   is_notification: boolean;
-  problems: string[];              // tolerant reader: recorded, not fatal
+  problems: string[]; // tolerant reader: recorded, not fatal
   payload: string;
 }
 
@@ -177,17 +205,56 @@ export interface QrBill {
 export interface ExtractedRef {
   kind: RefKind;
   value: string;
+  page?: number;
+  evidence?: string;
 }
 
 export interface ExtractedDate {
   date: string;
   label: string;
+  kind?:
+    | "document"
+    | "cover_letter"
+    | "case_opened"
+    | "execution"
+    | "claim"
+    | "birth"
+    | "observation"
+    | "due"
+    | "mentioned";
+  page?: number;
+  evidence?: string;
+}
+export interface PursuitDetails {
+  subtype: string;
+  parties: Array<{
+    role: "creditor" | "debtor" | "representative";
+    name: string;
+    page: number;
+  }>;
+  claim_amount: number | null;
+  interest: number | null;
+  fees: number | null;
+  outstanding_amount: number | null;
+  currency: string | null;
+}
+
+export interface CaseHandler {
+  name: string;
+  email: string | null;
+  phone: string | null;
+  routing_code: string | null;
+  page: number;
+  evidence: string;
 }
 
 // The normalized AI output -- the contract between the extraction
 // service and the pipeline. Never trust the model: everything here has
 // been through normalize().
 export interface Extraction {
+  ocr_source?: string;
+  metadata_source?: string;
+  metadata_warning?: string | null;
   doc_type: DocType;
   sender_name: string | null;
   sender_key: string;
@@ -197,6 +264,10 @@ export interface Extraction {
   summary_en: string | null;
   tags: string[];
   doc_date: string | null;
+  case_opened_date: string | null;
+  date_evidence: string | null;
+  pursuit: PursuitDetails | null;
+  case_handler: CaseHandler | null;
   due_date: string | null;
   amount: number | null;
   currency: string | null;
@@ -205,28 +276,20 @@ export interface Extraction {
   reminder_fee: number | null;
   refs: ExtractedRef[];
   ref_dates: ExtractedDate[];
-  page_order: number[] | null;     // 1-based positions, single-document case
-  page_groups: number[][] | null;  // several documents in one stack
-}
-
-export interface ExtractionResult {
-  ext: Extraction;
-  provider: ExtractionProvider;
 }
 
 // ------------------------------------------------------------ config
 export interface Config {
+  metadata_provider?: "local-server" | "claude-cli" | "local";
+  metadata_base_url?: string;
+  metadata_model?: string;
+  export_directory?: string;
+  ocr_engine?: "paddleocr-vl" | "tesseract";
+  ocr_python?: string;
+  ocr_device?: string;
   data_root: string;
-  scans_dir: string;
-  keep_originals: boolean;
+  scanner_device?: string;
   ocr_languages: string;
-  ocr_engine: string;
-  ai_provider: AiProvider;
-  ai_model: string;
-  ai_base_url: string;
-  ai_send_images: boolean;
-  ai_max_pages: number;
   default_payment_term_days: number;
-  blank_page_drop: boolean;
   min_chars_nonblank: number;
 }

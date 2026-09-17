@@ -5,6 +5,9 @@ export interface DocRowVM {
   id: number;
   created_at: string;
   doc_date: string | null;
+  scanned_at: string | null;
+  scan_date_source: string | null;
+  case_opened_date: string | null;
   title: string | null;
   doc_type: string | null;
   sender_id: number | null;
@@ -60,12 +63,29 @@ export interface TimelineVM {
 }
 
 export interface DetailVM extends DocRowVM {
+  has_pdf: boolean;
+  recognition: RecognitionVM;
+  metadata_history: Array<{
+    recorded_from: string;
+    recorded_to: string | null;
+    valid_from: string | null;
+    source: string;
+    snapshot: string;
+  }>;
+  sources: Array<{ key: string; bytes: number }>;
+  review_history: Array<{ at: string; note: string; checks: string }>;
   pdf_abs: string | null;
   invoice: InvoiceVM | null;
-  refs: Array<{ kind: string; value: string }>;
-  related: Array<{ id: number; title: string | null; doc_type: string | null;
-                   doc_date: string | null; created_at: string;
-                   kind: string; value: string }>;
+  refs: import("../domain/types").ExtractedRef[];
+  related: Array<{
+    id: number;
+    title: string | null;
+    doc_type: string | null;
+    doc_date: string | null;
+    created_at: string;
+    kind: string;
+    value: string;
+  }>;
   timeline: TimelineVM[];
   duplicates: number[];
 }
@@ -104,15 +124,11 @@ export interface StatsVM {
 }
 
 export interface StatusVM {
-  scanning: Array<{ batch: string; pages: number }>;
-  waiting: string[];
-  queued: string[];
-  processing: Array<{ batch: string; label: string | null;
-                      pct: number | null; ceil: number | null }>;
-  watcher_alive: boolean;
-  scanner_alive: boolean;
-  scanner_online: boolean;
   busy: boolean;
+  label: string;
+  processing: import("../domain/progress").ProcessingProgress | null;
+  background: import("../domain/progress").QueueProgress | null;
+  queue_version: number;
 }
 
 export interface SettingsVM extends Record<string, unknown> {
@@ -121,16 +137,74 @@ export interface SettingsVM extends Record<string, unknown> {
 
 interface DocdocBridge {
   call(method: string, params?: unknown): Promise<unknown>;
-  openExternal(id: number): void;
-  openFolder(id: number): void;
-  onEvent(cb: (msg: { event: string }) => void): void;
+  openExternal(id: number): Promise<void>;
+  importFiles(options?: {group_id?: number; after_page_id?: number}): Promise<number | null>;
+  backup(): Promise<string | null>;
+  exportPdf(id: number): Promise<string | null>;
+  onEvent(cb: (msg: { event: string; status?: StatusVM }) => void): void;
 }
 
 declare global {
-  interface Window { docdoc: DocdocBridge }
+  interface Window {
+    docdoc: DocdocBridge;
+  }
 }
 
 export const api = <T>(method: string, params?: unknown): Promise<T> =>
   window.docdoc.call(method, params) as Promise<T>;
 
 export const bridge = (): DocdocBridge => window.docdoc;
+
+export interface ReviewPageVM {
+  id: number;
+  group_id: number;
+  position: number;
+  text: string;
+  marker: string | null;
+  blank: number;
+  excluded: number;
+  issue: string | null;
+  batch: string;
+  source_page: number;
+  ocr_source?: string | null;
+}
+export interface ReviewGroupVM {
+  id: number;
+  title: string;
+  target_id: number | null;
+  revision: number;
+  phase: "pages" | "queued" | "processing" | "ready" | "error";
+  queue_error: string | null;
+  queue_note: string | null;
+  scanned_at: string | null;
+  recognition: RecognitionVM;
+  pages: ReviewPageVM[];
+  warnings: string[];
+  needs_preparation: boolean;
+  imports: Array<{ id: number; name: string; issue: string | null }>;
+  related: Array<{
+    id: number;
+    title: string;
+    sender_name: string;
+    value: string;
+  }>;
+  other_groups: Array<{ id: number; title: string }>;
+  queue_duplicates: Array<{ id: number; title: string }>;
+  duplicate: { id: number | null; reason: string | null };
+  metadata: {
+    title: string | null;
+    sender_name: string | null;
+    doc_type: string | null;
+    doc_date: string | null;
+    case_opened_date: string | null;
+    refs: import("../domain/types").ExtractedRef[];
+  };
+}
+export interface RecognitionVM {
+  source: string;
+  warning: string | null;
+  case_handler: import("../domain/types").CaseHandler | null;
+  dates: import("../domain/types").ExtractedDate[];
+  date_evidence: string | null;
+  pursuit: import("../domain/types").PursuitDetails | null;
+}

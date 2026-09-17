@@ -1,84 +1,41 @@
-# docdoc — features
+# docdoc 0.4
 
-## Implemented (v0.2)
+- Queue runs while the app is open; close to stop, reopen to resume.
+- Explicit USB/SANE scan and file import; no watcher or automatic retries.
+- SQLite stores PDFs, originals, previews, settings and unfinished work together.
+- Consistent one-file online backup and transactional legacy-file migration.
+- Raw scans remove blanks before OCR and open immediately for page review.
+- Rearrange, remove, restore, or insert another scan at any point in a set.
+- Done queues the set; scan again immediately while processing continues.
+- Persistent sidebar queue: OCR, metadata, classification, duplicate/relationship hints.
+- Automatic document separation by the configured model, with validated page ownership.
+- Local split rules for document IDs, numbering restarts and distinct letters; printed markers collate pages.
+- Ready to review documents enter Library only after Save to Library.
+- Edit queue metadata at any time; manual edits survive model completion.
+- Group related Library documents, inspect links, sort by document or scan date.
+- Edit metadata directly from Library; page revisions retain the same document ID.
+- Archived PDFs include searchable OCR, XMP metadata and embedded text/JSON.
+- Save PDF as… is the only export control.
+- Missing/repeated page markers, mixed totals, blank-page and duplicate hints.
+- Shared references suggest related unfiled groups and saved documents.
+- Split, combine, reorder and exclude pages; nonblocking page warnings.
+- Separate scan/blank-check and background OCR progress; independent cancellation.
+- Persistent queue progress: stages, elapsed time, page counts and individual page status.
+- Autofilled titles, types, dates and canonical senders; persistent editable details.
+- Schema-constrained local model extraction; configurable server/model in Settings.
+- Optional Claude Haiku or OCR-only mode; no automatic cloud fallback.
+- Case references and named handlers with direct contacts and source evidence.
+- Cached model results in SQLite; page changes invalidate old suggestions.
+- Sender lookup before creation, with existing-name suggestions and ambiguity checks.
+- Pursuit category, typed matching identifiers, parties and printed amounts.
+- Separate capture, issue, case-initiation and referenced dates with page evidence.
+- Metadata correction history with valid and recorded time intervals, as-of lookup.
+- Image-based blank detection handles connected borders, registration marks and folds.
+- Blank pages skip OCR; restore choices persist across retries.
+- Batched OCR and recognition of only new pages speed up queue processing.
+- Reopen a saved document to add missing pages; retain its prior PDF and sources.
+- Lightweight Review/Library interface, local FTS5 search, lazy paginated preview.
+- Existing Swiss invoice/payment data and QR display remain accessible in details.
+- No required AI service, cloud dependency or separate vector database.
 
-- **Single-app architecture**: one Electron app owns everything — data
-  layer in-process (better-sqlite3), pipeline and watcher as in-app
-  modules spawning native CLI tools, tray + login autostart. No Python,
-  no systemd services, no stdio API server (all removed 2026-07-20; the
-  old implementation is at git tag `python-final`).
-- **Button scanning, zero polling**: the ADS-4300N's hardware buttons
-  push scans (PDF over SFTP, Ethernet, firmware-side) into ~/Scans; the
-  in-app watcher picks them up via inotify. The app's Scan button drives
-  scanimage over eSCL/USB. No paper-sensor polling anywhere.
-- **Local AI option**: `local-vllm` provider (OpenAI-compatible endpoint,
-  structured outputs) for fully offline extraction with Qwen3-VL on this
-  machine's GPUs (~6 s/doc benchmarked); claude-cli remains the cloud
-  option and the fallback tier.
-- **Drop-in pipeline**: paper inserted → searchable PDF/A archive +
-  desktop notification, fully automatic.
-- **Instant visibility**: the scanned PDF is filed and viewable in the app
-  ~1 s after the feeder stops (fast ingest: raw PDF + thumbnail under a
-  provisional name); OCR + AI run per document on a persistent background
-  queue (survives restarts, "reading…" chip until done) and fill in text,
-  metadata and the final archive filename live.
-- **Multi-document stacks**: when several documents are fed as one scan
-  (e.g. two invoices), the AI reports the page grouping; the pipeline
-  splits the PDF, re-extracts each part with its own QR-bill, and files
-  them as separate documents with their own invoice records.
-- **Abort**: one button in the app stops everything in flight — kills the
-  running scanimage and the background queue mid-stage (OCR/AI children
-  killed) and deletes all temp scans: partial batch, waiting/queued
-  batches, workdirs and every ingested document still awaiting OCR/AI
-  (row, PDF, thumbnail, originals). Fully processed documents are never
-  touched.
-- **OCR**: OCRmyPDF/tesseract 5 with tessdata_best (deu+fra+ita+eng),
-  auto-rotate, deskew, per-page text, thumbnails.
-- **AI understanding (vision)**: document type, sender (canonical registry),
-  title, language, doc date, due date, amounts, summary, tags — the model
-  reads the page images, not just OCR text.
-- **Internal references**: invoice/customer/policy/contract/case/member
-  numbers extracted and indexed; documents sharing a reference are linked
-  ("related documents"). Insurance policy ↔ premium invoices ↔ claims.
-- **Timeline** per document: own dates, scan date, dates of documents it
-  mentions, invoice chain (due dates, reminders, payment), related docs.
-- **Swiss QR-bill**: full SPC v2.2/v2.3 parser (QR-IBAN, QRR/SCOR
-  validation, Swico S1 → due date, notification bills), re-render with
-  Swiss cross for banking-app payment, amount updated for reminder fees.
-- **Invoice lifecycle**: open → reminded → paid; reminders (Mahnung/rappel/
-  sollecito) auto-linked to the original (QR ref / invoice no. / AI
-  adjudication), fees tracked, chain settled together; overdue dashboard.
-  Mark paid records which bank account paid and the payment value date
-  (default: next working day); accounts managed in the Bank accounts tab.
-  Invoices settled elsewhere (employer, direct debit, dispute) can be
-  closed as "do not pay" with a comment saying where they went.
-- **Page order**: AI reports correct reading order (page-number markers as
-  cross-check); blank duplex backsides dropped (recorded, reviewable).
-- **Dedup, layered**: exact bytes → exact text → same references+type →
-  text similarity soft flag. Duplicates linked, never silently rejected.
-- **Search**: SQLite FTS5, diacritics-folded, prefix search-as-you-type,
-  snippets, ranked (title/sender boosted).
-- **App**: Electron 37, sandboxed renderer, pdf.js preview, inbox review
-  queue, filters, senders, activity log, live updates, settings.
-- **Robustness**: failed batches quarantined in failed/ with events;
-  originals retained; heuristic no-AI degraded mode.
-
-## Roadmap (from research; roughly ordered)
-
-1. **Email-in**: forward invoice mails to a local address → same pipeline
-   (Papra's most-loved feature). Also drag-and-drop PDF import in the app.
-3. **Due-date notifications**: scheduled reminders ("Helvetia due in 3
-   days"), paperless-ngx-style scheduled workflow triggers.
-4. **Reports**: spend per sender/category/quarter, year-end totals,
-   open-items aging (the Neat/Evernote lesson: DMS + report layer).
-5. **Auto-learning matcher**: train per-sender/type classifier on
-   confirmed documents only, as a cheap pre-AI pass (paperless-ngx auto).
-6. **RAG chat**: "when does my Helvetia policy renew?" over the archive
-   (embeddings + local LLM; 4×4090 available).
-7. **eBill awareness**: parse lines 33/34 alternative procedures.
-8. **pain.001 export**: batch-pay open invoices via e-banking upload.
-9. **Retention rules**: Swiss 10-year business-document retention hints,
-   archive expiry review.
-10. **Mobile companion / share links**, document versions, audit trail.
-11. **PDF/A verification + jbig2 compression** (build jbig2enc) for
-    smaller archives.
+The scanner's system driver (`ipp-usb` for the ADS-4300N) is still required.

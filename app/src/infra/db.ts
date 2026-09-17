@@ -1,4 +1,4 @@
-// SQLite schema and access. One writer (app/pipeline), WAL mode.
+// SQLite schema and access. One foreground writer, rollback journaling.
 //
 // FTS5 follows the external-content pattern: the index reads from
 // documents by rowid, kept in sync by triggers (explicit rowid inserts
@@ -11,14 +11,22 @@ import * as fs from "fs";
 import * as path from "path";
 import Database from "better-sqlite3";
 import { fold, normRef } from "../domain/textsim";
-import type { DocumentRow, EventKind, QrAddress, RefKind, SenderRow }
-  from "../domain/types";
+import { matchSender } from "../domain/senders";
+import type {
+  DocumentRow,
+  EventKind,
+  QrAddress,
+  RefKind,
+  SenderRow,
+} from "../domain/types";
 import * as config from "./config";
+import { initializeMetadataHistory } from "./metadata_history";
 
 export type Db = Database.Database;
 
 const SCHEMA = String.raw`
-PRAGMA journal_mode=WAL;
+PRAGMA journal_mode=DELETE;
+PRAGMA synchronous=FULL;
 
 CREATE TABLE IF NOT EXISTS senders (
     id INTEGER PRIMARY KEY,
@@ -34,6 +42,9 @@ CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,          -- ingest time, ISO
     doc_date TEXT,                     -- the document's own date, ISO
+    scanned_at TEXT,                   -- capture/import time, never an OCR date
+    scan_date_source TEXT,
+    case_opened_date TEXT,             -- only when explicitly stated
     title TEXT,
     doc_type TEXT,                     -- invoice|reminder|receipt|letter|contract|statement|return_slip|other
     sender_id INTEGER REFERENCES senders(id),
@@ -122,6 +133,7 @@ CREATE TABLE IF NOT EXISTS doc_refs (
     kind TEXT NOT NULL,                -- invoice_no|customer_no|policy_no|contract_no|case_no|member_no|qr_reference|other
     value TEXT NOT NULL,               -- as printed on the document
     norm TEXT NOT NULL                 -- uppercase alnum only, for matching
+    ,page INTEGER, evidence TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_doc_refs_doc ON doc_refs(document_id);
 CREATE INDEX IF NOT EXISTS idx_doc_refs_norm ON doc_refs(norm);
@@ -172,16 +184,21 @@ export function connect(dbFile?: string): Db {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const con = new Database(file, { timeout: 30000 });
   con.pragma("foreign_keys = ON");
-  const seedAccounts = !con.prepare(
-    `SELECT 1 FROM sqlite_master WHERE type='table' AND name='bank_accounts'`
-  ).get();
+  const seedAccounts = !con
+    .prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name='bank_accounts'`,
+    )
+    .get();
   migrate(con);
   con.exec(SCHEMA);
+  initializeMetadataHistory(con);
   if (seedAccounts) {
     const ins = con.prepare(
-      "INSERT OR IGNORE INTO bank_accounts(id, holder, bank) VALUES (?,?,?)");
+      "INSERT OR IGNORE INTO bank_accounts(id, holder, bank) VALUES (?,?,?)",
+    );
     for (const row of PRESET_ACCOUNTS) ins.run(...row);
   }
+  fs.chmodSync(file, 0o600);
   return con;
 }
 
@@ -191,12 +208,25 @@ export function connect(dbFile?: string): Db {
  * on new columns apply.
  */
 function migrate(con: Db): void {
-  const cols = (table: string): Set<string> => new Set(
-    (con.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
-      .map((r) => r.name));
+  const cols = (table: string): Set<string> =>
+    new Set(
+      (
+        con.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+          name: string;
+        }>
+      ).map((r) => r.name),
+    );
   const doc = cols("documents");
   if (doc.size && !doc.has("pending"))
     con.exec("ALTER TABLE documents ADD COLUMN pending TEXT");
+  for (const column of ["scanned_at", "scan_date_source", "case_opened_date"])
+    if (doc.size && !doc.has(column))
+      con.exec(`ALTER TABLE documents ADD COLUMN ${column} TEXT`);
+  const refs = cols("doc_refs");
+  if (refs.size && !refs.has("page"))
+    con.exec("ALTER TABLE doc_refs ADD COLUMN page INTEGER");
+  if (refs.size && !refs.has("evidence"))
+    con.exec("ALTER TABLE doc_refs ADD COLUMN evidence TEXT");
   const inv = cols("invoices");
   if (inv.size && !inv.has("paid_account_id"))
     con.exec(`ALTER TABLE invoices ADD COLUMN paid_account_id INTEGER
@@ -206,47 +236,103 @@ function migrate(con: Db): void {
 export const nowIso = (): string => new Date().toISOString().slice(0, 19);
 
 export function event(
-  con: Db, kind: EventKind, message: string,
-  { batch = null, documentId = null, at = null }:
-    { batch?: string | null; documentId?: number | null; at?: string | null } = {},
+  con: Db,
+  kind: EventKind,
+  message: string,
+  {
+    batch = null,
+    documentId = null,
+    at = null,
+  }: {
+    batch?: string | null;
+    documentId?: number | null;
+    at?: string | null;
+  } = {},
 ): void {
-  con.prepare(
-    "INSERT INTO events(at, kind, batch, document_id, message) VALUES (?,?,?,?,?)"
-  ).run(at ?? nowIso(), kind, batch, documentId, message);
+  con
+    .prepare(
+      "INSERT INTO events(at, kind, batch, document_id, message) VALUES (?,?,?,?,?)",
+    )
+    .run(at ?? nowIso(), kind, batch, documentId, message);
 }
 
 /** Create or enrich a sender; never overwrite good data with null. */
+export function findSender(con: Db, name: string): SenderRow | undefined {
+  return matchSender(
+    con.prepare("SELECT * FROM senders ORDER BY id").all() as SenderRow[],
+    name,
+  );
+}
+
 export function upsertSender(
-  con: Db, key: string, name: string,
-  { uid = null, iban = null, address = null }:
-    { uid?: string | null; iban?: string | null; address?: QrAddress | null } = {},
+  con: Db,
+  key: string,
+  name: string,
+  {
+    uid = null,
+    iban = null,
+    address = null,
+  }: {
+    uid?: string | null;
+    iban?: string | null;
+    address?: QrAddress | null;
+  } = {},
 ): number {
   const addr = address ? JSON.stringify(address) : null;
-  const row = con.prepare("SELECT * FROM senders WHERE key=?").get(key) as
-    SenderRow | undefined;
+  const row = matchSender(
+    con.prepare("SELECT * FROM senders ORDER BY id").all() as SenderRow[],
+    name,
+    { uid, iban },
+  );
   if (!row) {
-    return Number(con.prepare(
-      "INSERT INTO senders(key, name, uid, iban, address) VALUES (?,?,?,?,?)"
-    ).run(key, name, uid, iban, addr).lastInsertRowid);
+    const originalKey = key;
+    for (
+      let suffix = 2;
+      con.prepare("SELECT 1 FROM senders WHERE key=?").get(key);
+      suffix++
+    )
+      key = `${originalKey}-${suffix}`;
+    return Number(
+      con
+        .prepare(
+          "INSERT INTO senders(key, name, uid, iban, address) VALUES (?,?,?,?,?)",
+        )
+        .run(key, name, uid, iban, addr).lastInsertRowid,
+    );
   }
-  con.prepare(
-    `UPDATE senders SET name=COALESCE(?, name), uid=COALESCE(?, uid),
-     iban=COALESCE(?, iban), address=COALESCE(?, address) WHERE id=?`
-  ).run(name, uid, iban, addr, row.id);
+  con
+    .prepare(
+      `UPDATE senders SET uid=COALESCE(uid, ?),
+     iban=COALESCE(iban, ?), address=COALESCE(address, ?) WHERE id=?`,
+    )
+    .run(uid, iban, addr, row.id);
   return row.id;
 }
 
 /** refs: [kind, value] pairs. Skips short/duplicate values. */
 export function addRefs(
-  con: Db, documentId: number, refs: Array<[RefKind, string]>,
+  con: Db,
+  documentId: number,
+  refs: Array<[RefKind, string]>,
 ): void {
   const seen = new Set<string>();
   const ins = con.prepare(
-    "INSERT INTO doc_refs(document_id, kind, value, norm) VALUES (?,?,?,?)");
+    "INSERT INTO doc_refs(document_id, kind, value, norm) VALUES (?,?,?,?)",
+  );
   for (const [kind, value] of refs) {
     const n = normRef(value);
-    if (n.length < 4 || seen.has(n)) continue;  // too short to be a meaningful ID
-    seen.add(n);
+    const identity = `${kind}:${n}`;
+    if (
+      n.length < 4 ||
+      seen.has(identity) ||
+      con
+        .prepare(
+          "SELECT 1 FROM doc_refs WHERE document_id=? AND kind=? AND norm=?",
+        )
+        .get(documentId, kind, n)
+    )
+      continue;
+    seen.add(identity);
     ins.run(documentId, kind, String(value).trim(), n);
   }
 }
@@ -263,33 +349,58 @@ export interface RelatedDocument {
 }
 
 /** Documents sharing any internal reference with this one. */
-export function relatedDocuments(con: Db, documentId: number): RelatedDocument[] {
-  return con.prepare(
-    `SELECT DISTINCT d.id, d.title, d.doc_type, d.doc_date, d.created_at,
+export function relatedDocuments(
+  con: Db,
+  documentId: number,
+): RelatedDocument[] {
+  return con
+    .prepare(
+      `SELECT DISTINCT d.id, d.title, d.doc_type, d.doc_date, d.created_at,
             d.sender_name, a.kind, a.value
      FROM doc_refs a
-     JOIN doc_refs b ON b.norm = a.norm AND b.document_id != a.document_id
+     JOIN doc_refs b ON b.norm = a.norm AND b.kind = a.kind AND b.document_id != a.document_id
      JOIN documents d ON d.id = b.document_id AND d.status != 'trash'
      WHERE a.document_id = ?
-     ORDER BY COALESCE(d.doc_date, d.created_at)`
-  ).all(documentId) as RelatedDocument[];
+     ORDER BY COALESCE(d.doc_date, d.created_at)`,
+    )
+    .all(documentId) as RelatedDocument[];
 }
 
 export type SearchHit = DocumentRow & { snip: string; rank: number };
 
 /** FTS search-as-you-type: each token quoted, last token prefixed. */
 export function search(con: Db, query: string, limit = 100): SearchHit[] {
-  const tokens = fold(query).split(/\s+/)
+  const tokens = fold(query)
+    .split(/\s+/)
     .map((t) => t.replace(/"/g, ""))
     .filter((t) => t.replace(/[*"]/g, "").trim());
   if (!tokens.length) return [];
-  const match = tokens.slice(0, -1).map((t) => `"${t}"`).join(" ")
-    + ` "${tokens[tokens.length - 1]}"*`;
-  return con.prepare(
-    `SELECT d.*, snippet(doc_fts, 1, '<b>', '</b>', ' … ', 12) AS snip,
+  const match =
+    tokens
+      .slice(0, -1)
+      .map((t) => `"${t}"`)
+      .join(" ") + ` "${tokens[tokens.length - 1]}"*`;
+  const hits = con
+    .prepare(
+      `SELECT d.*, snippet(doc_fts, 1, '<b>', '</b>', ' … ', 12) AS snip,
             bm25(doc_fts, 5.0, 1.0, 3.0, 2.0) AS rank
      FROM doc_fts JOIN documents d ON d.id = doc_fts.rowid
      WHERE doc_fts MATCH ? AND d.status != 'trash'
-     ORDER BY rank LIMIT ?`
-  ).all(match.trim(), limit) as SearchHit[];
+     ORDER BY rank LIMIT ?`,
+    )
+    .all(match.trim(), limit) as SearchHit[];
+  const ref = normRef(query);
+  const references =
+    /\d/.test(ref) && ref.length >= 4
+      ? (con
+          .prepare(
+            `SELECT DISTINCT d.*, '' snip, -1 rank FROM documents d JOIN doc_refs r ON r.document_id=d.id WHERE r.norm LIKE ? AND d.status!='trash' LIMIT ?`,
+          )
+          .all(`${ref}%`, limit) as SearchHit[])
+      : [];
+  return [...references, ...hits]
+    .filter(
+      (hit, i, all) => all.findIndex((other) => other.id === hit.id) === i,
+    )
+    .slice(0, limit);
 }

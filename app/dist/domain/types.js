@@ -10,10 +10,32 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.REF_KINDS = exports.DOC_TYPES = void 0;
 // ------------------------------------------------------------ vocabulary
 exports.DOC_TYPES = [
-    "invoice", "reminder", "receipt", "letter", "contract", "policy",
-    "statement", "return_slip", "medical", "insurance", "tax", "other",
+    "pursuit",
+    "invoice",
+    "reminder",
+    "receipt",
+    "letter",
+    "contract",
+    "policy",
+    "statement",
+    "return_slip",
+    "medical",
+    "insurance",
+    "tax",
+    "other",
 ];
 exports.REF_KINDS = [
-    "invoice_no", "customer_no", "policy_no", "contract_no", "case_no",
-    "member_no", "order_no", "qr_reference", "other",
+    "pursuit_no",
+    "debt_certificate_no",
+    "office_ref",
+    "claim_no",
+    "invoice_no",
+    "customer_no",
+    "policy_no",
+    "contract_no",
+    "case_no",
+    "member_no",
+    "order_no",
+    "qr_reference",
+    "other",
 ];

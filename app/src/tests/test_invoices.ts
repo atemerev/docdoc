@@ -13,7 +13,7 @@ import * as db from "../infra/db";
 import * as invoices from "../services/invoices";
 import { check, finish } from "./fixtures";
 
-const CFG = { ai_provider: "none", default_payment_term_days: 30 } as Config;
+const CFG = { default_payment_term_days: 30 } as Config;
 
 function addDoc(con: db.Db, title: string, docType: string): number {
   return Number(con.prepare(
@@ -128,24 +128,8 @@ async function main(): Promise<void> {
   check("empty IBAN allowed (stored NULL)",
         api.list_bank_accounts()[0].iban === null);
 
-  // status() events fallback: an abort event (logged with batch=NULL)
-  // must terminate every in-flight batch, else the aborted batch ghosts
-  // as "processing" and the app sticks at "Aborting…"
-  db.event(api.con, "batch-start", "ingesting 3 page(s)",
-           { batch: "testbatch-abort" });
-  let st = await api.status();
-  check("batch-start shows in processing fallback",
-        st.processing.some((p) => p.batch === "testbatch-abort"));
-  db.event(api.con, "abort", "scan aborted from the app");
-  st = await api.status();
-  check("abort event clears the in-flight batch",
-        !st.processing.some((p) => p.batch === "testbatch-abort"));
-  db.event(api.con, "batch-start", "ingesting 2 page(s)",
-           { batch: "testbatch-after" });
-  st = await api.status();
-  check("batch started after an abort still shows",
-        st.processing.some((p) => p.batch === "testbatch-after"));
-  db.event(api.con, "document", "filed", { batch: "testbatch-after" });
+  db.event(api.con, "batch-start", "old incomplete batch", {batch:"historical"});
+  check("old events never restart foreground work", !api.status().busy);
   api.con.close();
 
   // paying with an account and a value date records both, chain-wide;

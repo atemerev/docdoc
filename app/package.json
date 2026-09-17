@@ -1,13 +1,14 @@
 {
   "name": "docdoc",
-  "version": "0.3.0",
-  "description": "AI-enabled document scanning and management platform",
+  "version": "0.4.0",
+  "description": "Foreground document scanning, page review, and a single-file archive",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc && tsc -p tsconfig.renderer.json && esbuild src/renderer/app.ts --bundle --format=esm --outfile=renderer/app.js --external:./pdfjs/pdf.mjs --log-level=warning",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc && tsc -p tsconfig.renderer.json && esbuild src/renderer/app.ts --bundle --format=esm --outfile=renderer/app.js --external:./pdfjs/pdf.mjs --log-level=warning",
     "start": "npm run build && electron .",
-    "test": "npm run build && for t in qrbill invoices blank pipeline; do ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron dist/tests/test_$t.js || exit 1; done",
-    "postinstall": "electron-rebuild -f -w better-sqlite3"
+    "test": "npm run build && for t in qrbill invoices blank preocr metadata pursuit correspondence metadata_model storage scanner pdf_export document_split autosave pipeline; do ELECTRON_RUN_AS_NODE=1 node_modules/electron/dist/electron dist/tests/test_$t.js || exit 1; done && python3 python/test_pdf.py",
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "test:ui": "npm run build && xvfb-run -a node_modules/.bin/electron dist/tests/test_ui.js"
   },
   "license": "MIT",
   "devDependencies": {
@@ -23,6 +24,7 @@
     "better-sqlite3": "^12.11.1",
     "jpeg-js": "^0.4.4",
     "pdfjs-dist": "^4.10.38",
-    "pngjs": "^7.0.0"
+    "pngjs": "^7.0.0",
+    "zod": "^4.6.5"
   }
 }

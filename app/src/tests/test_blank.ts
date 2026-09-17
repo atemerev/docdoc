@@ -8,7 +8,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-import { inkCoverage, isBlank } from "../infra/imaging";
+import { inkCoverage, isBlank, isBlankBeforeOcr } from "../infra/imaging";
 import { check, finish } from "./fixtures";
 
 const W = 1240, H = 1754;   // A4 at 150 dpi
@@ -68,6 +68,28 @@ function main(): void {
           isBlank("Rechnung Nr. 2026-001", wedged) === false);
     check("isBlank: missing image falls back to text",
           isBlank("", path.join(td, "gone.png")) === true);
+
+    check("before OCR: clean and skewed backsides are blank",
+          isBlankBeforeOcr(clean) && isBlankBeforeOcr(wedged));
+    check("before OCR: photos remain", !isBlankBeforeOcr(photo));
+    const connectedBorder = save(svgPage(
+      `<path d="M10 0 V${H-10} H${W} M0 10 H${W}" fill="none" stroke="#555" stroke-width="22"/>` +
+      `<rect x="${W*.025}" y="${H*.45}" width="18" height="15" fill="#222"/>` + CREASE_AND_STAIN), "border.png");
+    check("before OCR: connected L-shaped borders and registration blocks are blank", isBlankBeforeOcr(connectedBorder));
+    const borderWriting = save(svgPage(
+      `<path d="M10 0 V${H-10} H${W}" fill="none" stroke="#555" stroke-width="22"/>` +
+      '<text x="90" y="400" font-size="26" fill="#ccc">A faint note survives the scanner border</text>'), "border-note.png");
+    check("before OCR: faint notes survive scanner borders", !isBlankBeforeOcr(borderWriting));
+    const sparse = save(svgPage('<text x="90" y="100" font-size="24">Only a few words</text>'), "sparse.png");
+    const footer = save(svgPage(`<text x="600" y="${H - 30}" font-size="20">3</text>`), "footer.png");
+    const faint = save(svgPage('<text x="90" y="400" font-size="26" fill="#ccc">Faint handwriting</text>'), "faint.png");
+    const signature = save(svgPage('<path d="M300 700 Q330 600 345 690 T395 695 L440 670" fill="none" stroke="#333" stroke-width="2"/>'), "signature.png");
+    check("before OCR: sparse text remains", !isBlankBeforeOcr(sparse));
+    check("before OCR: margin page number remains", !isBlankBeforeOcr(footer));
+    check("before OCR: faint text remains", !isBlankBeforeOcr(faint));
+    check("before OCR: handwriting remains", !isBlankBeforeOcr(signature));
+    check("before OCR: any existing PDF text protects the page", !isBlankBeforeOcr(clean, "A"));
+    check("before OCR: missing image is kept", !isBlankBeforeOcr(path.join(td, "gone.png")));
   } finally {
     fs.rmSync(td, { recursive: true, force: true });
   }

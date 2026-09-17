@@ -1,9 +1,4 @@
 "use strict";
-// End-to-end pipeline test: synthetic invoice (with QR-bill) + Mahnung
-// run through the full pipeline -- img2pdf/ocrmypdf OCR, QR decode,
-// extraction (heuristics, no AI dependency), reminder linking via shared
-// refs, dedup on rescan, multi-document stack splitting. Fully isolated
-// temp data_root; touches nothing real. Takes ~1 min (4x OCR).
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -37,145 +32,266 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
+// Real OCR/PDF integration and durable review, isolated from the user's database.
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
 const path = __importStar(require("path"));
+const strict_1 = __importDefault(require("node:assert/strict"));
+const config_1 = require("../infra/config");
 const db = __importStar(require("../infra/db"));
-const extraction_1 = require("../services/extraction");
-const pipeline = __importStar(require("../services/pipeline"));
+const store = __importStar(require("../infra/storage"));
+const flow = __importStar(require("../services/pipeline"));
+const ocr = __importStar(require("../infra/ocr"));
+const exec_1 = require("../infra/exec");
+const collation_1 = require("../domain/collation");
 const fixtures_1 = require("./fixtures");
 async function main() {
-    const td = fs.mkdtempSync(path.join(os.tmpdir(), "pipetest-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "docdoc-test-"));
     const cfg = {
-        data_root: td,
-        scans_dir: path.join(td, "scans"),
-        keep_originals: true,
-        ocr_languages: "deu+fra+ita+eng",
+        ...config_1.DEFAULTS,
+        metadata_provider: "local",
         ocr_engine: "tesseract",
-        ai_provider: "none",
-        ai_model: "sonnet",
-        ai_base_url: "http://localhost:8000/v1",
-        ai_send_images: true,
-        ai_max_pages: 4,
-        default_payment_term_days: 30,
-        blank_page_drop: true,
-        min_chars_nonblank: 12,
+        data_root: dir,
+        ocr_languages: "deu+fra+ita+eng",
     };
-    const con = db.connect(path.join(td, "docdoc.db"));
+    let con = db.connect(path.join(dir, "docdoc.db"));
+    store.init(con);
+    const progress = [];
+    const status = (s, stage) => {
+        console.log(s);
+        if (stage)
+            progress.push(stage);
+    };
+    const input = (name, data) => {
+        const file = path.join(dir, name);
+        fs.writeFileSync(file, data);
+        return file;
+    };
+    const saving = (id, title, note = "") => ({
+        id,
+        revision: flow.group(con, id).revision,
+        title,
+        note,
+    });
     try {
-        // fixtures
-        const invDir = path.join(td, "in", "fixture-invoice");
-        const mahDir = path.join(td, "in", "fixture-mahnung");
-        fs.mkdirSync(invDir, { recursive: true });
-        fs.mkdirSync(mahDir, { recursive: true });
-        fs.writeFileSync(path.join(invDir, "page-001.png"), (0, fixtures_1.invoicePage)());
-        fs.writeFileSync(path.join(mahDir, "page-001.png"), (0, fixtures_1.mahnungPage)());
-        // rescan copy for the dedup check (same paper, separate batch)
-        const dupDir = path.join(td, "in", "fixture-invoice-rescan");
-        fs.mkdirSync(dupDir, { recursive: true });
-        fs.copyFileSync(path.join(invDir, "page-001.png"), path.join(dupDir, "page-001.png"));
-        console.log("== invoice batch (QR-bill) ==");
-        const docInv = (await pipeline.processBatch(cfg, con, invDir));
-        const dInv = con.prepare("SELECT * FROM documents WHERE id=?")
-            .get(docInv);
-        (0, fixtures_1.check)("document filed (pending cleared)", dInv.pending === null);
-        (0, fixtures_1.check)("classified as invoice", dInv.doc_type === "invoice", String(dInv.doc_type));
-        (0, fixtures_1.check)("OCR text captured", (dInv.content || "").includes("Hausratversicherung"), `(len ${String(dInv.content || "").length})`);
-        (0, fixtures_1.check)("archive PDF exists", fs.existsSync(path.join(td, "archive", dInv.pdf_path)), dInv.pdf_path ?? "");
-        (0, fixtures_1.check)("thumbnail exists", fs.existsSync(path.join(td, "thumbs", dInv.thumb_path)));
-        const inv = con.prepare("SELECT * FROM invoices WHERE document_id=?").get(docInv);
-        (0, fixtures_1.check)("invoice row with QR reference", inv?.qr_reference === fixtures_1.QRR, String(inv?.qr_reference));
-        (0, fixtures_1.check)("QR amount authoritative", inv?.amount === 249.60, String(inv?.amount));
-        (0, fixtures_1.check)("due date from Swico /40/ net term", inv?.due_date === "2026-07-15", String(inv?.due_date));
-        (0, fixtures_1.check)("sender from QR creditor", (dInv.sender_name || "").includes("Helvetia"), String(dInv.sender_name));
-        const refs = con.prepare("SELECT norm FROM doc_refs WHERE document_id=?").all(docInv).map((r) => r.norm);
-        (0, fixtures_1.check)("invoice number extracted as ref", refs.includes("RE20260042"), refs.join(","));
-        (0, fixtures_1.check)("policy number extracted as ref", refs.includes("P778899"), refs.join(","));
-        console.log("== Mahnung batch (no QR; links via refs) ==");
-        const docMah = (await pipeline.processBatch(cfg, con, mahDir));
-        const dMah = con.prepare("SELECT * FROM documents WHERE id=?")
-            .get(docMah);
-        (0, fixtures_1.check)("classified as reminder", dMah.doc_type === "reminder", String(dMah.doc_type));
-        const mah = con.prepare("SELECT * FROM invoices WHERE document_id=?").get(docMah);
-        (0, fixtures_1.check)("reminder level 1", mah?.reminder_level === 1, String(mah?.reminder_level));
-        (0, fixtures_1.check)("reminder linked to the invoice chain", mah?.parent_invoice_id === inv.id, `parent=${mah?.parent_invoice_id} inv=${inv.id}`);
-        const root = con.prepare("SELECT * FROM invoices WHERE id=?").get(inv.id);
-        (0, fixtures_1.check)("original moved to status reminded", root.status === "reminded");
-        (0, fixtures_1.check)("related documents linked via shared refs", db.relatedDocuments(con, docMah).some((r) => r.id === docInv));
-        console.log("== rescan dedup ==");
-        const docDup = (await pipeline.processBatch(cfg, con, dupDir));
-        const dDup = con.prepare("SELECT * FROM documents WHERE id=?")
-            .get(docDup);
-        (0, fixtures_1.check)("rescan detected as duplicate", dDup.duplicate_of === docInv, `duplicate_of=${dDup.duplicate_of} reason=${dDup.dup_reason}`);
-        const nInv = con.prepare("SELECT COUNT(*) c FROM invoices").get().c;
-        (0, fixtures_1.check)("duplicate created no extra invoice row", nInv === 2, `(got ${nInv})`);
-        console.log("== two documents in one scanned stack ==");
-        // detection needs a model; stub the extractor to test the split
-        // mechanics (partitioned PDFs, per-part rows/invoices/refs) exactly
-        let calls = 0;
-        (0, extraction_1.setExtractor)(async (_c, _images, _text, opts) => {
-            calls++;
-            const base = { language: "de", tags: ["test"], refs: [] };
-            if (calls === 1) // stack-level: report the split
-                return { ext: (0, extraction_1.normalize)({ ...base, doc_type: "other",
-                        sender_name: "stack", page_groups: [[1], [2]] }, opts?.qr ?? null),
-                    provider: "heuristic" };
-            const who = calls === 2
-                ? { sender_name: "Alpha Versicherung AG", amount: 111.10,
-                    invoice_ref: "ALPHA-1", title: "Rechnung Alpha" }
-                : { sender_name: "Beta Energie SA", amount: 222.20,
-                    invoice_ref: "BETA-2", title: "Facture Beta" };
-            return { ext: (0, extraction_1.normalize)({ ...base, doc_type: "invoice",
-                    doc_date: "2026-07-01", ...who,
-                    refs: [{ kind: "invoice_no", value: who.invoice_ref }] }, opts?.qr ?? null), provider: "heuristic" };
+        await store.migrateFiles(con, cfg);
+        const knownSender = db.upsertSender(con, "helvetia", "Helvetia Versicherungen AG");
+        console.log("== capture is durable before OCR ==");
+        const original = (0, fixtures_1.invoicePage)(), file = input("invoice.png", original);
+        const invoiceGroup = flow.queueFiles(con, [file], "Invoice");
+        fs.unlinkSync(file);
+        strict_1.default.equal(con.prepare("SELECT COUNT(*) n FROM documents").get()
+            .n, 0);
+        const source = con.prepare("SELECT source_key FROM imports").get().source_key;
+        strict_1.default.deepEqual(store.get(con, source).data, original);
+        await flow.readGroup(cfg, con, invoiceGroup, status);
+        const invGroup = flow.workbench(con).find((g) => g.id === invoiceGroup);
+        (0, strict_1.default)(invGroup.pages[0].text.includes("Hausratversicherung"));
+        strict_1.default.equal(invGroup.pages.length, 1);
+        strict_1.default.equal(invGroup.metadata.sender_name, "Helvetia Versicherungen AG");
+        strict_1.default.equal(invGroup.metadata.doc_type, "invoice");
+        strict_1.default.match(invGroup.title, /Rechnung/);
+        (0, strict_1.default)(invGroup.pages[0].qr_json, "QR metadata available before saving");
+        strict_1.default.deepEqual([...new Set(progress.map((p) => p.stage))], ["prepare", "blank", "recognize", "check", "details"]);
+        (0, strict_1.default)(progress.some((p) => p.stage === "check" && p.completed === p.total));
+        const invoiceId = await flow.fileGroup(cfg, con, saving(invoiceGroup, "Insurance invoice"), status);
+        (0, strict_1.default)(store
+            .get(con, store.docKey(invoiceId))
+            .data.subarray(0, 4)
+            .equals(Buffer.from("%PDF")));
+        (0, strict_1.default)(!fs.existsSync(path.join(dir, "archive")));
+        const inv = con
+            .prepare("SELECT * FROM invoices WHERE document_id=?")
+            .get(invoiceId);
+        strict_1.default.equal(inv.qr_reference, fixtures_1.QRR);
+        strict_1.default.equal(inv.amount, 249.6);
+        strict_1.default.equal(inv.sender_id, knownSender);
+        const captured = con
+            .prepare("SELECT captured_at FROM imports WHERE source_key=?")
+            .get(source);
+        const dated = con
+            .prepare("SELECT scanned_at,scan_date_source FROM documents WHERE id=?")
+            .get(invoiceId);
+        strict_1.default.equal(dated.scanned_at, captured.captured_at, "capture time survives filing");
+        strict_1.default.equal(dated.scan_date_source, "capture");
+        strict_1.default.equal(con.prepare("SELECT count(*) n FROM senders").get().n, 1);
+        strict_1.default.equal(db.search(con, "Hausratversicherung")[0].id, invoiceId);
+        console.log("== no automatic stack split; review groups span scans ==");
+        const first = input("first.png", (0, fixtures_1.page)([
+            [180, 160, 55, true, "Example Corporation"],
+            [180, 350, 45, false, "Contract Nr. CASE-1234"],
+            [180, 800, 45, false, "First section of agreement"],
+            [180, 3000, 40, false, "Page 1 of 3"],
+        ]));
+        const third = input("third.png", (0, fixtures_1.page)([
+            [180, 160, 55, true, "Example Corporation"],
+            [180, 350, 45, false, "Contract Nr. CASE-1234"],
+            [180, 800, 45, false, "Final section and signature"],
+            [180, 3000, 40, false, "Page 3 of 3"],
+        ]));
+        const blank = input("blank.png", (0, fixtures_1.page)([]));
+        const stack = flow.queueFiles(con, [third, blank, first], "Mixed stack");
+        await flow.readGroup(cfg, con, stack, status);
+        let group = flow.workbench(con).find((g) => g.id === stack);
+        strict_1.default.equal(group.pages.length, 3);
+        (0, strict_1.default)(group.pages[1].blank);
+        strict_1.default.equal(group.pages[1].excluded, 1, "blank backside automatically excluded");
+        strict_1.default.equal(group.pages[0].excluded, 0, "printed page remains included");
+        flow.editPage(con, group.pages[1].id, stack, false);
+        flow.editPage(con, group.pages[0].id, stack, true);
+        flow.updateMetadata(con, stack, {
+            title: "My contract",
+            sender_name: "Example Corporation",
+            doc_type: "contract",
         });
-        try {
-            const stackDir = path.join(td, "in", "fixture-stack");
-            fs.mkdirSync(stackDir, { recursive: true });
-            // unique pages (reusing earlier fixtures would trip exact-text dedup)
-            fs.writeFileSync(path.join(stackDir, "page-001.png"), (0, fixtures_1.page)([
-                [180, 160, 64, true, "Alpha Versicherung AG"],
-                [180, 860, 56, true, "Rechnung ALPHA-1"],
-                [180, 1400, 44, false, "Praemie total: CHF 111.10"],
-            ]));
-            fs.writeFileSync(path.join(stackDir, "page-002.png"), (0, fixtures_1.page)([
-                [180, 160, 64, true, "Beta Energie SA"],
-                [180, 860, 56, true, "Facture BETA-2"],
-                [180, 1400, 44, false, "Montant total: CHF 222.20"],
-            ]));
-            const primary = await pipeline.processBatch(cfg, con, stackDir);
-            const parts = con.prepare("SELECT * FROM documents WHERE batch='fixture-stack' ORDER BY id").all();
-            (0, fixtures_1.check)("stack produced two documents", parts.length === 2, `(got ${parts.length})`);
-            (0, fixtures_1.check)("first part keeps the ingested row", parts[0]?.id === primary);
-            (0, fixtures_1.check)("both parts fully processed", parts.every((p) => p.pending === null));
-            (0, fixtures_1.check)("one page each", parts.every((p) => p.pages === 1), parts.map((p) => p.pages).join(","));
-            (0, fixtures_1.check)("distinct senders", (parts[0]?.sender_name ?? "").includes("Alpha")
-                && (parts[1]?.sender_name ?? "").includes("Beta"), parts.map((p) => p.sender_name).join(" | "));
-            (0, fixtures_1.check)("distinct archive PDFs exist", parts.every((p) => fs.existsSync(path.join(td, "archive", p.pdf_path)))
-                && parts[0].pdf_path !== parts[1].pdf_path);
-            (0, fixtures_1.check)("multi-doc flags set", JSON.parse(parts[0].flags).includes("multi-doc:1/2")
-                && JSON.parse(parts[1].flags).includes("multi-doc:2/2"));
-            const stackInvs = con.prepare(`SELECT i.* FROM invoices i JOIN documents d ON d.id=i.document_id
-         WHERE d.batch='fixture-stack' ORDER BY i.id`).all();
-            (0, fixtures_1.check)("an invoice row per part", stackInvs.length === 2
-                && stackInvs[0].amount === 111.10 && stackInvs[1].amount === 222.20, stackInvs.map((i) => i.amount).join(","));
-            (0, fixtures_1.check)("parts have their own page rows", parts.every((p) => con.prepare("SELECT COUNT(*) c FROM pages WHERE document_id=?").get(p.id).c === 1));
-        }
-        finally {
-            (0, extraction_1.resetExtractor)();
-        }
-        console.log("== originals + events ==");
-        pipeline.finishBatch(cfg, mahDir, true, true);
-        (0, fixtures_1.check)("finishBatch moves batch to originals/", fs.existsSync(path.join(td, "originals", "fixture-mahnung", "page-001.png")) && !fs.existsSync(mahDir));
-        const kinds = con.prepare("SELECT DISTINCT kind FROM events").all().map((r) => r.kind);
-        (0, fixtures_1.check)("events logged", kinds.includes("batch-start")
-            && kinds.includes("document"), kinds.join(","));
+        await flow.readGroup(cfg, con, stack, status);
+        group = flow.workbench(con).find((g) => g.id === stack);
+        strict_1.default.equal(group.title, "My contract", "recognition preserves manual edits");
+        strict_1.default.equal(group.pages[1].excluded, 0, "restoring a blank survives OCR retry");
+        strict_1.default.equal(group.pages[0].excluded, 1, "manual removal survives OCR retry");
+        flow.editPage(con, group.pages[0].id, stack, false);
+        group = flow.workbench(con).find((g) => g.id === stack);
+        (0, strict_1.default)(group.warnings.some((w) => w.includes("missing pages: 2")));
+        (0, strict_1.default)(group.warnings.some((w) => w.includes("out of order")));
+        strict_1.default.equal(flow.workbench(con).length, 1);
+        const revision = group.revision;
+        flow.editPage(con, group.pages[1].id, stack, true);
+        flow.reorder(con, stack, [
+            group.pages[2].id,
+            group.pages[0].id,
+            group.pages[1].id,
+        ]);
+        strict_1.default.throws(() => flow.reorder(con, stack, [group.pages[0].id, group.pages[0].id]), /exactly once/);
+        await strict_1.default.rejects(flow.fileGroup(cfg, con, { ...saving(stack, "Contract"), revision }, status), /changed/);
+        const second = input("second.png", (0, fixtures_1.page)([
+            [180, 160, 55, true, "Example Corporation"],
+            [180, 350, 45, false, "Contract Nr. CASE-1234"],
+            [180, 800, 45, false, "Middle section with obligations"],
+            [180, 3000, 40, false, "Page 2 of 3"],
+        ]));
+        const later = flow.queueFiles(con, [second], "Later scan");
+        await flow.readGroup(cfg, con, later, status);
+        const laterGroup = flow.workbench(con).find((g) => g.id === later);
+        (0, strict_1.default)(laterGroup.other_groups.some((g) => g.id === stack));
+        flow.editPage(con, laterGroup.pages[0].id, stack);
+        flow.removeEmptyGroup(con, later);
+        (0, strict_1.default)(!flow.workbench(con).some((group) => group.id === later));
+        (0, strict_1.default)(store.has(con, laterGroup.pages[0].source_key));
+        group = flow.workbench(con).find((g) => g.id === stack);
+        const included = group.pages
+            .filter((p) => !p.excluded)
+            .sort((a, b) => Number(a.marker?.split("/")[0]) - Number(b.marker?.split("/")[0]));
+        flow.reorder(con, stack, [
+            ...included.map((p) => p.id),
+            ...group.pages.filter((p) => p.excluded).map((p) => p.id),
+        ]);
+        group = flow.workbench(con).find((g) => g.id === stack);
+        (0, strict_1.default)(!group.warnings.some((w) => /missing|out of order/.test(w)));
+        const contractId = await flow.fileGroup(cfg, con, saving(stack, "Complete contract"), status);
+        const contract = con
+            .prepare("SELECT * FROM documents WHERE id=?")
+            .get(contractId);
+        strict_1.default.equal(contract.pages, 3);
+        const contractPdf = input("contract.pdf", store.get(con, store.docKey(contractId)).data);
+        strict_1.default.equal(await ocr.pageCount(contractPdf), 3);
+        strict_1.default.equal(con
+            .prepare("SELECT COUNT(*) n FROM review_pages WHERE document_id=?")
+            .get(contractId).n, 4);
+        console.log("== warnings do not block a normal save ==");
+        const partial = flow.queueFiles(con, [first], "Incomplete contract");
+        await flow.readGroup(cfg, con, partial, status);
+        (0, strict_1.default)(flow
+            .workbench(con)
+            .find((g) => g.id === partial)
+            .warnings.some((w) => w.includes("missing")));
+        const partialId = await flow.fileGroup(cfg, con, saving(partial, "Incomplete contract"), status);
+        const history = con
+            .prepare("SELECT note,checks FROM review_log WHERE document_id=?")
+            .get(partialId);
+        strict_1.default.equal(history.note, "");
+        (0, strict_1.default)(!("checks" in JSON.parse(history.checks)), "saving does not fabricate user attestations");
+        strict_1.default.equal((0, collation_1.checkPages)([
+            {
+                id: 1,
+                text: "A normal unnumbered letter.",
+                excluded: 0,
+                blank: 0,
+                issue: null,
+            },
+        ]).length, 0);
+        console.log("== reminders and duplicate scans ==");
+        const reminder = flow.queueFiles(con, [input("reminder.png", (0, fixtures_1.mahnungPage)())], "Reminder");
+        await flow.readGroup(cfg, con, reminder, status);
+        (0, strict_1.default)(flow
+            .workbench(con)
+            .find((g) => g.id === reminder)
+            .related.some((r) => r.id === invoiceId));
+        const reminderId = await flow.fileGroup(cfg, con, saving(reminder, "Payment reminder"), status);
+        const rem = con
+            .prepare("SELECT * FROM invoices WHERE document_id=?")
+            .get(reminderId);
+        strict_1.default.equal(rem.parent_invoice_id, inv.id);
+        const duplicate = flow.queueFiles(con, [input("duplicate.png", original)], "Duplicate");
+        await flow.readGroup(cfg, con, duplicate, status);
+        const dupId = await flow.fileGroup(cfg, con, saving(duplicate, "Duplicate insurance invoice"), status);
+        strict_1.default.equal(con
+            .prepare("SELECT duplicate_of FROM documents WHERE id=?")
+            .get(dupId).duplicate_of, invoiceId);
+        (0, strict_1.default)(!con.prepare("SELECT 1 FROM invoices WHERE document_id=?").get(dupId));
+        console.log("== reopen preserves saved PDF until verified ==");
+        const before = store.get(con, store.docKey(contractId)).data;
+        const reopened = await flow.reopenDocument(con, contractId, status);
+        strict_1.default.deepEqual(store.get(con, store.docKey(contractId)).data, before);
+        await flow.readGroup(cfg, con, reopened, status);
+        const revised = await flow.fileGroup(cfg, con, saving(reopened, "Reviewed contract"), status);
+        strict_1.default.equal(revised, contractId);
+        (0, strict_1.default)(con
+            .prepare("SELECT 1 FROM assets WHERE key LIKE ?")
+            .get(`revision/${contractId}/%`));
+        console.log("== interrupted import and source-only recovery ==");
+        const pending = flow.queueFiles(con, [input("pending.png", original)], "Pending");
+        (0, exec_1.requestAbort)();
+        await strict_1.default.rejects(flow.readGroup(cfg, con, pending, status));
+        (0, exec_1.clearAbort)();
+        strict_1.default.equal(flow.workbench(con).find((g) => g.id === pending).imports.length, 1);
+        const bad = flow.queueFiles(con, [input("damaged.pdf", Buffer.from("not a pdf"))], "Damaged import");
+        await strict_1.default.rejects(flow.readGroup(cfg, con, bad, status));
+        (0, strict_1.default)(flow.workbench(con).find((g) => g.id === bad).imports[0]);
+        const revisedPdf = store.get(con, store.docKey(contractId)).data;
+        const backup = path.join(dir, "backup.db");
+        await store.backup(con, backup);
+        await strict_1.default.rejects(store.backup(con, backup), /already exists/);
+        con.close();
+        // Restore ONLY the backup, with no archive/original folders.
+        const restored = path.join(dir, "restore");
+        fs.mkdirSync(restored);
+        fs.copyFileSync(backup, path.join(restored, "docdoc.db"));
+        con = db.connect(path.join(restored, "docdoc.db"));
+        store.init(con);
+        strict_1.default.equal(con.pragma("integrity_check")[0]
+            .integrity_check, "ok");
+        strict_1.default.equal(con.pragma("journal_mode", { simple: true }), "delete");
+        strict_1.default.deepEqual(store.get(con, source).data, original);
+        strict_1.default.deepEqual(store.get(con, store.docKey(contractId)).data, revisedPdf);
+        (0, strict_1.default)(db.search(con, "Hausratversicherung").length >= 1);
+        await flow.readGroup({ ...cfg, data_root: restored }, con, pending, status);
+        strict_1.default.equal(flow.workbench(con).find((g) => g.id === pending).imports.length, 0);
+        (0, strict_1.default)(!fs.existsSync(path.join(restored, "archive")));
+        (0, strict_1.default)((0, collation_1.checkPages)([
+            { id: 1, text: "Page 1 of 3", excluded: 0, blank: 0, issue: null },
+        ]).some((w) => w.includes("2, 3")));
+        console.log("All foreground pipeline and restore checks passed.");
     }
     finally {
         con.close();
-        fs.rmSync(td, { recursive: true, force: true });
+        fs.rmSync(dir, { recursive: true, force: true });
     }
-    (0, fixtures_1.finish)();
 }
-void main().catch((e) => { console.error(e); process.exit(1); });
+void main().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+});

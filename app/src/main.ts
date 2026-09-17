@@ -1,256 +1,307 @@
-// docdoc Electron main process.
-//
-// Architecture: single app, no external services. All data work runs
-// in-process (src/api over better-sqlite3); heavy work (OCR, AI,
-// scanning) is spawned as child processes by the services. The renderer
-// is pure sandboxed UI talking through the preload bridge. App files
-// and document bytes are served over the app:// scheme so the renderer
-// runs on a proper secure origin (pdf.js workers, fetch, etc.).
-
-import { app, BrowserWindow, ipcMain, protocol, net, shell, Notification,
-         Tray, Menu } from "electron";
+// One visible Electron window owns all work. Closing it cancels children and exits.
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  protocol,
+  net,
+  shell,
+  dialog,
+} from "electron";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { pathToFileURL } from "url";
-
 import { Api } from "./api/api";
-import * as scanner from "./services/scanner";
-import * as watcher from "./services/watcher";
+import * as storage from "./infra/storage";
 
-// __dirname is dist/ after compilation; app assets live one level up
 const APP_DIR = path.join(__dirname, "..");
-
-let win: BrowserWindow | null = null;
-let api: Api | null = null;
-let dataRoot: string | null = null;
-let tray: Tray | null = null;
-
-declare global {
-  // eslint-disable-next-line no-var
-  var isQuitting: boolean | undefined;
+let win: BrowserWindow | null = null,
+  api: Api | null = null,
+  closing = false;
+const exportsDir = fs.mkdtempSync(path.join(os.tmpdir(), "docdoc-exports-"));
+if (process.env.DOCDOC_DB)
+  app.setPath(
+    "userData",
+    path.join(path.dirname(process.env.DOCDOC_DB), "electron-profile"),
+  );
+const readMethods = new Set([
+  "get_workbench",
+  "get_document",
+  "document_sources",
+  "list_documents",
+  "library_groups",
+  "search",
+  "list_invoices",
+  "list_senders",
+  "list_bank_accounts",
+  "list_events",
+  "stats",
+  "get_settings",
+  "list_metadata_models",
+  "years",
+  "status",
+  "metadata_history",
+  "metadata_as_of",
+  "storage_info",
+  "timeline",
+]);
+const writeMethods = new Set([
+  "render_qr",
+  "new_group",
+  "rename_group",
+  "update_group_metadata",
+  "refresh_document_metadata",
+  "remove_empty_group",
+  "edit_page",
+  "reorder_pages",
+  "read_group",
+  "enqueue_group",
+  "prepare_group",
+  "edit_group_pages",
+  "recognize_group_details",
+  "file_group",
+  "reopen_document",
+  "recover_source",
+  "scan_now",
+  "discover_scanners",
+  "update_document",
+  "trash_document",
+  "invoice_paid",
+  "invoice_do_not_pay",
+  "invoice_reopen",
+  "save_bank_account",
+  "delete_bank_account",
+  "set_settings",
+  "delete_review",
+]);
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "app",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+    },
+  },
+]);
+function send(): void {
+  if (win && !win.isDestroyed())
+    win.webContents.send("docdoc-event", {
+      event: "status",
+      status: api?.status(),
+    });
 }
-
-// ---------------------------------------------------------------- api
-async function call(method: string, params?: unknown): Promise<unknown> {
-  if (!api) throw new Error("api not ready");
-  const fn = (api as unknown as Record<string, unknown>)[method];
-  if (typeof fn !== "function" || method.startsWith("_"))
-    throw new Error(`unknown method '${method}'`);
-  return (fn as (p: unknown) => unknown).call(api, params ?? {});
+function trusted(event: Electron.IpcMainInvokeEvent): void {
+  if (
+    event.sender !== win?.webContents ||
+    !event.senderFrame?.url.startsWith("app://ui/")
+  )
+    throw new Error("Untrusted request.");
 }
-
-// Push {event:'changed'} to the renderer when any other connection
-// commits to the DB (PRAGMA data_version changes on foreign commits --
-// the watcher writes on its own connection, and external writers count
-// too).
-let lastDataVersion: number | null = null;
-function startChangePoller(): void {
-  setInterval(() => {
-    try {
-      const v = api!.con.pragma("data_version", { simple: true }) as number;
-      if (lastDataVersion !== null && v !== lastDataVersion)
-        sendEvent({ event: "changed" });
-      lastDataVersion = v;
-    } catch { /* db busy */ }
-  }, 1000);
-}
-
-function sendEvent(msg: object): void {
-  if (win && !win.isDestroyed()) win.webContents.send("docdoc-event", msg);
-}
-
-// ---------------------------------------------------------------- app://
-protocol.registerSchemesAsPrivileged([{
-  scheme: "app",
-  privileges: { standard: true, secure: true, supportFetchAPI: true,
-                stream: true },
-}]);
-
-const MIME: Record<string, string> = {
-  ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
-  ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json",
-  ".png": "image/png", ".jpg": "image/jpeg", ".woff2": "font/woff2",
-  ".map": "application/json",
-};
-
-function serveFile(absPath: string, mustBeUnder: string): Promise<Response> | Response {
-  const resolved = path.resolve(absPath);
-  if (!resolved.startsWith(path.resolve(mustBeUnder) + path.sep))
-    return new Response("forbidden", { status: 403 });
-  const type = MIME[path.extname(resolved).toLowerCase()]
-    ?? "application/octet-stream";
-  return net.fetch(pathToFileURL(resolved).toString()).then((r) =>
-    new Response(r.body, { headers: { "Content-Type": type } }));
-}
-
+ipcMain.handle("api", async (event, method: string, params: unknown) => {
+  if (closing) return null;
+  trusted(event);
+  if (!api) throw new Error("App is starting.");
+  if (
+    !readMethods.has(method) &&
+    !writeMethods.has(method) &&
+    method !== "abort_scan"
+  )
+    throw new Error("Unknown method.");
+  // Draft metadata is a synchronous SQLite edit; it can safely coexist with
+  // scanner acquisition and queue processing without taking either job's lock.
+  if (writeMethods.has(method) && !["update_group_metadata", "rename_group"].includes(method)) api.assertIdle();
+  try {
+    return await (api as unknown as Record<string, (p: unknown) => unknown>)[
+      method
+    ].call(api, params ?? {});
+  } finally {
+    if (writeMethods.has(method) || method === "abort_scan") send();
+  }
+});
+ipcMain.handle("import-files", async (event, options = {}) => {
+  trusted(event);
+  api!.assertIdle();
+  const result = await dialog.showOpenDialog(win!, {
+    title: "Import pages",
+    properties: ["openFile", "multiSelections"],
+    filters: [
+      {
+        name: "Documents and images",
+        extensions: ["pdf", "jpg", "jpeg", "png", "tif", "tiff", "pnm"],
+      },
+    ],
+  });
+  if (result.canceled) return null;
+  return api!.import_files(result.filePaths, options);
+});
+ipcMain.handle("backup", async (event) => {
+  trusted(event);
+  api!.assertIdle();
+  const result = await dialog.showSaveDialog(win!, {
+    title: "Back up docdoc",
+    defaultPath: path.join(
+      os.homedir(),
+      `docdoc-${new Date().toISOString().slice(0, 10)}.db`,
+    ),
+    filters: [{ name: "SQLite database", extensions: ["db"] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  await api!.backup_database(result.filePath);
+  return result.filePath;
+});
+ipcMain.handle("export-pdf", async (event, id: number) => {
+  trusted(event);
+  api!.assertIdle();
+  const result = await dialog.showSaveDialog(win!, {
+    title: "Save PDF as",
+    defaultPath: `document-${id}.pdf`,
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (!result.canceled && result.filePath)
+    await api!.export_pdf({ kind: "document", id }, result.filePath);
+  return result.filePath || null;
+});
+ipcMain.handle("open-external", async (event, id: number) => {
+  trusted(event);
+  const data = storage.get(api!.con, storage.docKey(id));
+  if (!data) throw new Error("PDF not found.");
+  const file = path.join(exportsDir, `document-${id}.pdf`);
+  fs.writeFileSync(file, data.data);
+  const error = await shell.openPath(file);
+  if (error) throw new Error(error);
+});
 function registerProtocol(): void {
   protocol.handle("app", async (req) => {
-    const url = new URL(req.url);
-    const parts = url.pathname.replace(/^\/+/, "").split("/");
+    const url = new URL(req.url),
+      parts = url.pathname.replace(/^\/+/, "").split("/");
     try {
       if (url.host === "ui") {
-        if (parts[0] === "pdfjs")
-          return serveFile(
-            path.join(APP_DIR, "node_modules/pdfjs-dist/build",
-                      ...parts.slice(1)),
-            path.join(APP_DIR, "node_modules/pdfjs-dist"));
-        return serveFile(path.join(APP_DIR, "renderer", ...parts),
-                         path.join(APP_DIR, "renderer"));
+        const root =
+          parts[0] === "pdfjs"
+            ? path.join(APP_DIR, "node_modules/pdfjs-dist/build")
+            : path.join(APP_DIR, "renderer");
+        const file = path.resolve(
+          root,
+          ...(parts[0] === "pdfjs" ? parts.slice(1) : parts),
+        );
+        if (!file.startsWith(root + path.sep))
+          return new Response("Forbidden", { status: 403 });
+        return net.fetch(pathToFileURL(file).toString());
       }
-      if (url.host === "doc") {
-        const doc = await call("get_document",
-          { id: parseInt(parts[0], 10) }) as { pdf_abs: string | null };
-        if (!doc.pdf_abs) return new Response("no pdf", { status: 404 });
-        const r = await net.fetch(pathToFileURL(doc.pdf_abs).toString());
-        return new Response(r.body, {
-          headers: { "Content-Type": "application/pdf" } });
-      }
-      if (url.host === "thumb") {
-        const id = String(parseInt(parts[0], 10)).padStart(5, "0");
-        return serveFile(path.join(dataRoot!, "thumbs", `${id}.jpg`),
-                         path.join(dataRoot!, "thumbs"));
-      }
-      return new Response("not found", { status: 404 });
+      const id = Number(parts[0]);
+      if (!Number.isSafeInteger(id) || id < 1)
+        return new Response("Not found", { status: 404 });
+      const key =
+        url.host === "doc"
+          ? storage.docKey(id)
+          : url.host === "thumb"
+            ? storage.docKey(id, "thumb")
+            : url.host === "page"
+              ? storage.pageKey(id, parts[1] === "thumb" ? "thumb" : "pdf")
+              : null;
+      const asset = key && api ? storage.get(api.con, key) : null;
+      if (!asset) return new Response("Not found", { status: 404 });
+      return new Response(new Uint8Array(asset.data), {
+        headers: { "Content-Type": asset.mime, "Cache-Control": "no-store" },
+      });
     } catch (e) {
       return new Response(String(e), { status: 500 });
     }
   });
 }
-
-// ---------------------------------------------------------------- window
-async function createWindow(): Promise<void> {
-  win = new BrowserWindow({
-    width: 1440,
-    height: 940,
-    minWidth: 980,
-    minHeight: 600,
-    backgroundColor: "#f5f6f8",
-    title: "docdoc",
-    icon: path.join(APP_DIR, "docdoc.png"),
-    webPreferences: {
-      preload: path.join(APP_DIR, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  });
-  win.setMenuBarVisibility(false);
-  // close-to-tray: the app keeps scanning/processing with the window shut
-  win.on("close", (e) => {
-    if (!globalThis.isQuitting) {
-      e.preventDefault();
-      win!.hide();
-    }
-  });
-  win.webContents.on("console-message",
-    (_e, level, message, line, src) => {
-      if (level >= 2)
-        console.log(`[renderer:${level}] ${message} (${src}:${line})`);
-    });
-  win.webContents.on("did-fail-load", (_e, code, desc, url) =>
-    console.log(`[load-fail] ${code} ${desc} ${url}`));
-  await win.loadURL("app://ui/index.html");
-  if (process.env.DOCDOC_SHOT) {
-    setTimeout(() => { void screenshot(); },
-      parseInt(process.env.DOCDOC_SHOT_DELAY || "5000", 10));
-  }
-}
-
-async function screenshot(): Promise<void> {
-  if (!win) return;
-  if (process.env.DOCDOC_JS) {
-    await win.webContents.executeJavaScript(process.env.DOCDOC_JS);
-    await new Promise((r) => setTimeout(r, 3500));
-  }
-  const img = await win.webContents.capturePage();
-  fs.writeFileSync(process.env.DOCDOC_SHOT!, img.toPNG());
-  console.log("screenshot:", process.env.DOCDOC_SHOT);
-}
-
-function setupTray(): void {
-  tray = new Tray(path.join(APP_DIR, "docdoc.png"));
-  tray.setToolTip("docdoc");
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Open docdoc", click: () => { void showWindow(); } },
-    { label: "Scan now", click: () => {
-        call("scan_now").catch((e: Error) =>
-          new Notification({ title: "Scan failed", body: e.message }).show());
-      } },
-    { type: "separator" },
-    { label: "Quit", click: () => { globalThis.isQuitting = true; app.quit(); } },
-  ]));
-  tray.on("click", () => { void showWindow(); });
-}
-
-async function showWindow(): Promise<void> {
-  if (win && !win.isDestroyed()) { win.show(); win.focus(); }
-  else await createWindow();
-}
-
-/**
- * Start (hidden) at login so button-pushed scans are processed without
- * anyone opening the app -- the single-app replacement for systemd units.
- */
-function setupAutostart(): void {
-  const dir = path.join(os.homedir(), ".config", "autostart");
-  const file = path.join(dir, "docdoc.desktop");
-  const exec = `${process.execPath} ${APP_DIR} --hidden`;
-  const content = `[Desktop Entry]
-Type=Application
-Name=docdoc
-Comment=Document scanning and management
-Exec=${exec}
-Icon=${path.join(APP_DIR, "docdoc.png")}
-X-GNOME-Autostart-enabled=true
-`;
+async function quit(): Promise<void> {
+  if (closing) return;
+  closing = true;
   try {
-    fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(file) || fs.readFileSync(file, "utf-8") !== content)
-      fs.writeFileSync(file, content);
-  } catch (e) {
-    console.log(`autostart: ${(e as Error).message}`);
+    await api?.shutdown();
+  } finally {
+    fs.rmSync(exportsDir, { recursive: true, force: true });
+    win?.destroy();
+    app.quit();
   }
 }
-
-ipcMain.handle("api", (_e, method: string, params: unknown) =>
-  call(method, params));
-ipcMain.handle("open-external", async (_e, id: number) => {
-  const doc = await call("get_document", { id }) as { pdf_abs: string | null };
-  if (doc.pdf_abs) void shell.openPath(doc.pdf_abs);
-});
-ipcMain.handle("open-folder", async (_e, id: number) => {
-  const doc = await call("get_document", { id }) as { pdf_abs: string | null };
-  if (doc.pdf_abs) shell.showItemInFolder(doc.pdf_abs);
-});
-
-// single instance: a second launch (autostart + manual, or a debug run)
-// must never start a second watcher against the live DB -- it focuses
-// the existing instance instead. app.quit() is asynchronous, so the
-// whole startup is gated on holding the lock (a denied instance must
-// not even create its tray icon).
 if (!app.requestSingleInstanceLock()) {
+  fs.rmSync(exportsDir, { recursive: true, force: true });
   app.exit(0);
 } else {
-  app.on("second-instance", () => { void showWindow(); });
+  app.on("second-instance", () => {
+    win?.show();
+    win?.focus();
+  });
   void app.whenReady().then(async () => {
-    registerProtocol();
-    api = new Api();
-    dataRoot = api.cfg.data_root;
-    startChangePoller();
-    setupTray();
-    setupAutostart();
-    watcher.start();
-    if (!process.argv.includes("--hidden")) await createWindow();
-    app.on("activate", () => { void showWindow(); });
+    try {
+      api = new Api();
+      await api.initialize();
+      api.onStatus = send;
+      // Remove only the obsolete autostart entry owned by this application.
+      if (!process.env.DOCDOC_DB) {
+        const startup = path.join(
+          os.homedir(),
+          ".config/autostart/docdoc.desktop",
+        );
+        if (
+          fs.existsSync(startup) &&
+          fs.readFileSync(startup, "utf8").includes(APP_DIR)
+        )
+          fs.unlinkSync(startup);
+      }
+      registerProtocol();
+      win = new BrowserWindow({
+        width: 1280,
+        height: 900,
+        minWidth: 850,
+        minHeight: 620,
+        title: "docdoc",
+        backgroundColor: "#f8f8f6",
+        webPreferences: {
+          preload: path.join(APP_DIR, "preload.js"),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+        },
+      });
+      win.setMenuBarVisibility(false);
+      win.on("close", (event) => {
+        if (!closing) {
+          event.preventDefault();
+          void quit();
+        }
+      });
+      win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      win.webContents.on("will-navigate", (event) => event.preventDefault());
+      win.webContents.on("console-message", (_e, level, message) => {
+        if (level >= 2) console.error(`renderer: ${message}`);
+      });
+      await win.loadURL("app://ui/index.html");
+      if (process.env.DOCDOC_SHOT)
+        setTimeout(
+          async () => {
+            if (process.env.DOCDOC_JS)
+              await win!.webContents.executeJavaScript(process.env.DOCDOC_JS);
+            fs.writeFileSync(
+              process.env.DOCDOC_SHOT!,
+              (await win!.webContents.capturePage()).toPNG(),
+            );
+            if (process.env.DOCDOC_EXIT_AFTER_SHOT) void quit();
+          },
+          Number(process.env.DOCDOC_SHOT_DELAY || 2000),
+        );
+    } catch (e) {
+      console.error(e);
+      dialog.showErrorBox("docdoc could not open", String(e));
+      app.exit(1);
+    }
   });
 }
-
-app.on("before-quit", () => {
-  globalThis.isQuitting = true;
-  scanner.stop();
-  watcher.stop();
+app.on("before-quit", (event) => {
+  if (!closing && api) {
+    event.preventDefault();
+    void quit();
+  }
 });
 app.on("window-all-closed", () => {
-  // stay alive in the tray; Quit lives in the tray menu
+  if (!closing) void quit();
 });

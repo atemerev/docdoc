@@ -44,7 +44,7 @@ const configMod = __importStar(require("../infra/config"));
 const db = __importStar(require("../infra/db"));
 const invoices = __importStar(require("../services/invoices"));
 const fixtures_1 = require("./fixtures");
-const CFG = { ai_provider: "none", default_payment_term_days: 30 };
+const CFG = { default_payment_term_days: 30 };
 function addDoc(con, title, docType) {
     return Number(con.prepare(`INSERT INTO documents(created_at, title, doc_type, status, reviewed)
      VALUES (?,?,?,'inbox',1)`).run(db.nowIso(), title, docType).lastInsertRowid);
@@ -131,19 +131,8 @@ async function main() {
     api.save_bank_account({ id: 1, holder: "Alexander Temerev",
         bank: "Postfinance", iban: "" });
     (0, fixtures_1.check)("empty IBAN allowed (stored NULL)", api.list_bank_accounts()[0].iban === null);
-    // status() events fallback: an abort event (logged with batch=NULL)
-    // must terminate every in-flight batch, else the aborted batch ghosts
-    // as "processing" and the app sticks at "Aborting…"
-    db.event(api.con, "batch-start", "ingesting 3 page(s)", { batch: "testbatch-abort" });
-    let st = await api.status();
-    (0, fixtures_1.check)("batch-start shows in processing fallback", st.processing.some((p) => p.batch === "testbatch-abort"));
-    db.event(api.con, "abort", "scan aborted from the app");
-    st = await api.status();
-    (0, fixtures_1.check)("abort event clears the in-flight batch", !st.processing.some((p) => p.batch === "testbatch-abort"));
-    db.event(api.con, "batch-start", "ingesting 2 page(s)", { batch: "testbatch-after" });
-    st = await api.status();
-    (0, fixtures_1.check)("batch started after an abort still shows", st.processing.some((p) => p.batch === "testbatch-after"));
-    db.event(api.con, "document", "filed", { batch: "testbatch-after" });
+    db.event(api.con, "batch-start", "old incomplete batch", { batch: "historical" });
+    (0, fixtures_1.check)("old events never restart foreground work", !api.status().busy);
     api.con.close();
     // paying with an account and a value date records both, chain-wide;
     // reopen clears them

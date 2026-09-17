@@ -1,6 +1,4 @@
 "use strict";
-// Configuration: JSON file at ~/.config/docdoc/config.json, editable
-// from the app's Settings page. Unknown keys are preserved.
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -37,45 +35,40 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.dbPath = exports.DEFAULTS = exports.CONFIG_PATH = void 0;
 exports.load = load;
-exports.save = save;
+// Defaults and legacy location discovery. Current settings are stored in SQLite.
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 exports.CONFIG_PATH = path.join(os.homedir(), ".config", "docdoc", "config.json");
 exports.DEFAULTS = {
-    // storage
-    data_root: "/pool/docdoc", // archive/, originals/, thumbs/, docdoc.db
-    scans_dir: "~/Scans", // where scan batches land
-    keep_originals: true, // move raw scans to originals/ (false = delete)
-    // OCR
+    metadata_provider: "local-server",
+    metadata_base_url: "http://127.0.0.1:8080/v1",
+    metadata_model: "",
+    export_directory: path.join(os.homedir(), "Documents", "scans"),
+    ocr_engine: "paddleocr-vl",
+    ocr_python: "/pool/docdoc/ocr-venv/bin/python",
+    ocr_device: "gpu:2",
+    data_root: "/pool/docdoc",
     ocr_languages: "deu+fra+ita+eng",
-    ocr_engine: "tesseract", // tesseract (via ocrmypdf); pluggable
-    // AI understanding
-    ai_provider: "claude-cli", // claude-cli | local-vllm | none
-    ai_model: "sonnet", // model passed to claude -p
-    ai_base_url: "http://localhost:8000/v1", // local-vllm OpenAI-compatible endpoint
-    ai_send_images: true, // send page images (vision), not just text
-    ai_max_pages: 4, // pages sent to AI per document (first N)
-    // behaviour
-    default_payment_term_days: 30, // Swiss convention when no /40/ tag
-    blank_page_drop: true, // drop blank duplex backsides from PDF
-    min_chars_nonblank: 12, // OCR chars below this = blank candidate
+    default_payment_term_days: 30,
+    min_chars_nonblank: 12,
 };
-const expand = (p) => p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 function load() {
     const cfg = { ...exports.DEFAULTS };
     try {
-        Object.assign(cfg, JSON.parse(fs.readFileSync(exports.CONFIG_PATH, "utf-8")));
+        Object.assign(cfg, JSON.parse(fs.readFileSync(exports.CONFIG_PATH, "utf8")));
     }
-    catch { /* first run / unreadable -> defaults */ }
-    cfg.data_root = expand(cfg.data_root);
-    cfg.scans_dir = expand(cfg.scans_dir);
+    catch {
+        /* first run */
+    }
+    cfg.data_root = process.env.DOCDOC_DB
+        ? path.dirname(path.resolve(process.env.DOCDOC_DB))
+        : cfg.data_root.startsWith("~")
+            ? path.join(os.homedir(), cfg.data_root.slice(1))
+            : cfg.data_root;
     return cfg;
 }
-function save(cfg) {
-    fs.mkdirSync(path.dirname(exports.CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(exports.CONFIG_PATH + ".tmp", JSON.stringify(cfg, Object.keys(cfg).sort(), 2));
-    fs.renameSync(exports.CONFIG_PATH + ".tmp", exports.CONFIG_PATH);
-}
-const dbPath = (cfg) => path.join((cfg ?? load()).data_root, "docdoc.db");
+const dbPath = (cfg) => process.env.DOCDOC_DB
+    ? path.resolve(process.env.DOCDOC_DB)
+    : path.join((cfg ?? load()).data_root, "docdoc.db");
 exports.dbPath = dbPath;

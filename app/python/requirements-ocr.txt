@@ -1,0 +1,7 @@
+# Local, short-lived worker. CUDA-enabled torch wheels for NVIDIA; use the
+# PyTorch CPU wheel index instead on machines without a GPU.
+paddleocr[doc-parser]==3.7.0
+transformers==5.17.0
+torch==2.8.0
+torchvision==0.23.0
+pymupdf==1.28.2

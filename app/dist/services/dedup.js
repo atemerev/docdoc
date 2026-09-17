@@ -57,21 +57,29 @@ function fileSha256(path) {
  * by the AI) and broadly similar text are scans of the same paper --
  * robust against OCR variance that defeats pure text similarity.
  */
-function refDuplicate(con, ext, content, minSimilarity = 0.5) {
-    const values = ext.refs.map((r) => r.value);
+function refDuplicate(con, ext, content, minSimilarity = 0.5, excludeId = 0) {
+    // Sharing a pursuit/case identifies related correspondence, not duplicate
+    // papers. Case stages may use nearly identical boilerplate.
+    if (ext.doc_type === "pursuit")
+        return { id: null, reason: null };
+    const values = ext.refs
+        .filter((r) => ["invoice_no", "order_no", "qr_reference"].includes(r.kind))
+        .map((r) => r.value);
     if (ext.invoice_ref)
         values.push(ext.invoice_ref);
     const norms = [...new Set(values.map(textsim_1.normRef).filter((n) => n.length >= 4))];
     if (!norms.length)
         return { id: null, reason: null };
     const tg = (0, textsim_1.trigrams)(content);
-    const rows = con.prepare(`SELECT DISTINCT d.id, d.content, d.doc_type FROM documents d
+    const rows = con
+        .prepare(`SELECT DISTINCT d.id, d.content, d.doc_type FROM documents d
      JOIN doc_refs r ON r.document_id = d.id
      WHERE r.norm IN (${norms.map(() => "?").join(",")})
-       AND d.status != 'trash'`).all(...norms);
+       AND d.status != 'trash' AND d.id != ?`)
+        .all(...norms, excludeId);
     for (const row of rows)
-        if (row.doc_type === ext.doc_type
-            && (0, textsim_1.jaccard)(tg, (0, textsim_1.trigrams)(row.content)) >= minSimilarity)
+        if (row.doc_type === ext.doc_type &&
+            (0, textsim_1.jaccard)(tg, (0, textsim_1.trigrams)(row.content)) >= minSimilarity)
             return { id: row.id, reason: "same-refs" };
     return { id: null, reason: null };
 }
@@ -79,11 +87,15 @@ function refDuplicate(con, ext, content, minSimilarity = 0.5) {
  * Hard match -> { id, reason }; soft match -> { id: null, reason:
  * 'similar:<id>' }; nothing -> { id: null, reason: null }.
  */
-function findDuplicates(con, sha, thash, content, similarThreshold = 0.75) {
-    let row = con.prepare("SELECT id FROM documents WHERE file_sha256=? AND status!='trash'").get(sha);
+function findDuplicates(con, sha, thash, content, similarThreshold = 0.75, excludeId = 0) {
+    let row = con
+        .prepare("SELECT id FROM documents WHERE file_sha256=? AND status!='trash' AND id!=?")
+        .get(sha, excludeId);
     if (row)
         return { id: row.id, reason: "exact-file" };
-    row = con.prepare("SELECT id FROM documents WHERE text_hash=? AND status!='trash'").get(thash);
+    row = con
+        .prepare("SELECT id FROM documents WHERE text_hash=? AND status!='trash' AND id!=?")
+        .get(thash, excludeId);
     if (row)
         return { id: row.id, reason: "exact-text" };
     const tg = (0, textsim_1.trigrams)(content);
@@ -92,11 +104,12 @@ function findDuplicates(con, sha, thash, content, similarThreshold = 0.75) {
     const n = (0, textsim_1.normalizeText)(content).length;
     // candidates: comparable text length only (cheap pre-filter at
     // personal-archive scale)
-    for (const r of con.prepare(`SELECT id, content FROM documents
-       WHERE status != 'trash' AND content IS NOT NULL
+    for (const r of con
+        .prepare(`SELECT id, content FROM documents
+       WHERE status != 'trash' AND content IS NOT NULL AND id!=?
          AND length(content) BETWEEN ? AND ?
        ORDER BY id DESC LIMIT 500`)
-        .iterate(Math.floor(n * 0.6), Math.floor(n * 1.6) + 64)) {
+        .iterate(excludeId, Math.floor(n * 0.6), Math.floor(n * 1.6) + 64)) {
         const row2 = r;
         if ((0, textsim_1.jaccard)(tg, (0, textsim_1.trigrams)(row2.content)) >= similarThreshold)
             return { id: null, reason: `similar:${row2.id}` };

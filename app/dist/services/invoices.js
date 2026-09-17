@@ -17,14 +17,15 @@ exports.listInvoices = listInvoices;
 const qrbill_1 = require("../domain/qrbill");
 const textsim_1 = require("../domain/textsim");
 const db_1 = require("../infra/db");
-const extraction_1 = require("./extraction");
 const today = () => new Date().toISOString().slice(0, 10);
 /** Create the invoices row for a document (invoice or reminder). */
-async function recordInvoice(con, cfg, documentId, senderId, ext, qr) {
+function recordInvoice(con, cfg, documentId, senderId, ext, qr) {
     const notes = [];
     // idempotency: a crashed earlier run (or rowid reuse after a manual
     // delete) may have left an invoice for this document -- never crash on it
-    const existing = con.prepare("SELECT id FROM invoices WHERE document_id=?").get(documentId);
+    const existing = con
+        .prepare("SELECT id FROM invoices WHERE document_id=?")
+        .get(documentId);
     if (existing) {
         notes.push(`invoice #${existing.id} already exists for this document`);
         return { invoiceId: existing.id, notes };
@@ -38,14 +39,16 @@ async function recordInvoice(con, cfg, documentId, senderId, ext, qr) {
     }
     const isNotification = qr?.is_notification ? 1 : 0;
     const level = ext.reminder_level ?? 0;
-    const info = con.prepare(`INSERT INTO invoices(document_id, sender_id, status, amount, currency,
+    const info = con
+        .prepare(`INSERT INTO invoices(document_id, sender_id, status, amount, currency,
          amount_due, due_date, invoice_ref, qr_iban, qr_ref_type,
          qr_reference, qr_creditor, qr_payload, swico, is_notification,
          reminder_level, fees)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(documentId, senderId, isNotification ? "void" : "open", amount, ext.currency || qr?.currency || "CHF", amount, due, ext.invoice_ref, qr?.iban ?? null, qr?.ref_type ?? null, qr?.reference ?? null, qr?.creditor ? JSON.stringify(qr.creditor) : null, qr?.payload ?? null, qr?.swico ? JSON.stringify(qr.swico) : null, isNotification, level, ext.reminder_fee || 0);
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(documentId, senderId, isNotification ? "void" : "open", amount, ext.currency || qr?.currency || "CHF", amount, due, ext.invoice_ref, qr?.iban ?? null, qr?.ref_type ?? null, qr?.reference ?? null, qr?.creditor ? JSON.stringify(qr.creditor) : null, qr?.payload ?? null, qr?.swico ? JSON.stringify(qr.swico) : null, isNotification, level, ext.reminder_fee || 0);
     const invId = Number(info.lastInsertRowid);
     if (level > 0) {
-        const parent = await findParent(con, cfg, senderId, ext, qr, invId, notes);
+        const parent = findParent(con, cfg, senderId, ext, qr, invId, notes);
         if (parent)
             linkReminder(con, invId, parent, ext, due, notes);
         else
@@ -61,12 +64,12 @@ const ROOT = `i.status IN ('open','reminded') AND i.parent_invoice_id IS NULL
  * Chain root for a reminder: the original invoice or, when that was
  * never scanned, the earliest scanned reminder (so consecutive orphan
  * reminders collate into one chain). Deterministic identifiers first
- * (QR reference, invoice number, shared refs -- these are exact), then
- * AI adjudication over the open roots; bare sender/amount heuristics
- * only in no-AI degraded mode. Invoices of trashed documents never match.
+ * (QR reference, invoice number, shared refs). Invoices of trashed
+ * documents never match. Sender/amount alone never joins payment chains.
  */
-async function findParent(con, cfg, senderId, ext, qr, excludeId, notes) {
-    const q = (sql, args) => con.prepare(sql + " AND i.id != ? ORDER BY i.id DESC")
+function findParent(con, cfg, senderId, ext, qr, excludeId, notes) {
+    const q = (sql, args) => con
+        .prepare(sql + " AND i.id != ? ORDER BY i.id DESC")
         .get(...args, excludeId);
     if (qr?.reference) {
         const row = q(`SELECT i.* FROM invoices i WHERE i.qr_reference = ?
@@ -93,33 +96,6 @@ async function findParent(con, cfg, senderId, ext, qr, excludeId, notes) {
         if (row)
             return row;
     }
-    // no exact identifier matched -- let the model decide among open roots
-    const candidates = con.prepare(`SELECT i.id, i.invoice_ref, i.amount, i.currency, i.due_date,
-            d.sender_name, d.title, d.doc_date
-     FROM invoices i JOIN documents d ON d.id = i.document_id
-     WHERE ${ROOT} AND d.status != 'trash'
-       AND i.id != ? ORDER BY i.id DESC LIMIT 25`).all(excludeId);
-    const { invoiceId, reason } = await (0, extraction_1.matchReminder)(cfg, ext, candidates);
-    if (invoiceId) {
-        notes.push(`AI matched reminder to invoice #${invoiceId}: ${reason}`);
-        return con.prepare("SELECT * FROM invoices WHERE id=?")
-            .get(invoiceId);
-    }
-    if (["claude-cli", "local-vllm"].includes(cfg.ai_provider))
-        return null; // the model looked and found no clear match
-    // degraded mode without AI: sender+amount heuristics
-    if (senderId && ext.amount != null) {
-        const row = q(`SELECT i.* FROM invoices i WHERE i.sender_id = ?
-                   AND ${ROOT} AND i.amount BETWEEN ? AND ?`, [senderId, ext.amount - 60, ext.amount + 0.01]);
-        if (row)
-            return row;
-    }
-    if (senderId) {
-        const row = q(`SELECT i.* FROM invoices i WHERE i.sender_id = ?
-                   AND ${ROOT}`, [senderId]);
-        if (row)
-            return row;
-    }
     return null;
 }
 function linkReminder(con, invId, parent, ext, due, notes) {
@@ -134,21 +110,26 @@ function linkReminder(con, invId, parent, ext, due, notes) {
             notes.push(`reminder fee implied from amounts: ${fee.toFixed(2)}`);
         }
     }
-    con.prepare("UPDATE invoices SET parent_invoice_id=? WHERE id=?")
+    con
+        .prepare("UPDATE invoices SET parent_invoice_id=? WHERE id=?")
         .run(parent.id, invId);
-    con.prepare(`UPDATE invoices SET status='reminded', amount_due=?,
-         due_date=COALESCE(?, due_date), fees=fees+? WHERE id=?`).run(newDue, due, fee, parent.id);
-    notes.push(`linked to invoice #${parent.id}`
-        + (fee ? `, fee ${fee.toFixed(2)}` : ""));
+    con
+        .prepare(`UPDATE invoices SET status='reminded', amount_due=?,
+         due_date=COALESCE(?, due_date), fees=fees+? WHERE id=?`)
+        .run(newDue, due, fee, parent.id);
+    notes.push(`linked to invoice #${parent.id}` + (fee ? `, fee ${fee.toFixed(2)}` : ""));
 }
 /** The whole reminder chain (original + all its reminders). */
 function chainIds(con, invoiceId) {
-    const row = con.prepare("SELECT * FROM invoices WHERE id=?")
+    const row = con
+        .prepare("SELECT * FROM invoices WHERE id=?")
         .get(invoiceId);
     if (!row)
         return [];
     const root = row.parent_invoice_id ?? row.id;
-    return con.prepare("SELECT id FROM invoices WHERE id=? OR parent_invoice_id=?").all(root, root).map((r) => r.id);
+    return con
+        .prepare("SELECT id FROM invoices WHERE id=? OR parent_invoice_id=?")
+        .all(root, root).map((r) => r.id);
 }
 /**
  * Paying any member settles the whole chain. paidDate (ISO date) may lie
@@ -191,7 +172,7 @@ function reopen(con, invoiceId) {
  * scanned (an orphan reminder still is unpaid money -- it must show).
  * max_reminder_level covers the whole chain, including the root itself.
  */
-function listInvoices(con, { status = null, limit = 500 } = {}) {
+function listInvoices(con, { status = null, limit = 500, } = {}) {
     let where = "1=1";
     let args = [];
     if (status === "overdue") {
@@ -205,7 +186,8 @@ function listInvoices(con, { status = null, limit = 500 } = {}) {
         where = "i.status = ?";
         args = [status];
     }
-    return con.prepare(`SELECT i.*, d.title, d.sender_name, d.doc_date, d.pdf_path, d.thumb_path,
+    return con
+        .prepare(`SELECT i.*, d.title, d.sender_name, d.doc_date, d.pdf_path, d.thumb_path,
             d.reviewed, d.pending,
             (i.status IN ('open','reminded') AND i.due_date < '${today()}')
                 AS overdue,
@@ -218,5 +200,6 @@ function listInvoices(con, { status = null, limit = 500 } = {}) {
      WHERE ${where} AND d.status != 'trash' AND i.parent_invoice_id IS NULL
      ORDER BY CASE WHEN i.status IN ('open','reminded') THEN 0 ELSE 1 END,
               i.due_date IS NULL, i.due_date, i.id DESC
-     LIMIT ?`).all(...args, limit);
+     LIMIT ?`)
+        .all(...args, limit);
 }
